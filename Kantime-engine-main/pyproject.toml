@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kantime-engine"
+version = "2.0.0"
+description = "Vendor-neutral Windows framework for resilient payer-portal RPA"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "Pillow==12.3.0",
+    "openpyxl==3.1.5",
+    "playwright==1.63.0",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller==6.22.3"]
+
+[project.scripts]
+kantime = "kantime_engine.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kantime_engine*"]

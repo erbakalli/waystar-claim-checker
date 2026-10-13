@@ -1,0 +1,38 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  framework-and-generated-application:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install framework
+        run: python -m pip install -e ".[build]"
+      - name: Run framework tests
+        run: python -m unittest discover -s tests -v
+      - name: Scaffold and verify a standalone application
+        shell: pwsh
+        run: |
+          $sample = Join-Path $env:RUNNER_TEMP "sample-portal"
+          kantime new $sample --package sample_portal --name "Sample Portal"
+          Push-Location $sample
+          kantime validate
+          kantime test
+          kantime build --mode onefile
+          $process = Start-Process -FilePath ".\dist\Sample Portal.exe" -ArgumentList "--smoke-test" -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Generated executable smoke test failed" }
+          $listing = python -m PyInstaller.utils.cliutils.archive_viewer -r -b ".\dist\Sample Portal.exe"
+          if ($listing -match "uhc|unitedhealth|aetna") {
+            throw "Framework sample contains payer-specific modules"
+          }
+          Pop-Location
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-portal-windows
+          path: ${{ runner.temp }}/sample-portal/dist/Sample Portal.exe

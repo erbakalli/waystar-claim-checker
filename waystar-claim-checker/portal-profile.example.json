@@ -1,0 +1,24 @@
+{
+  "verified": true,
+  "initial_search_input": "#search-text",
+  "search_mode_toggle": "#dropdownMenuButton1",
+  "selected_pcn": "#lblSearchTerm:text-is('PCN')",
+  "pcn_option": "a[onclick=\"UpdateSearchTerm('PCN');\"]:visible",
+  "search_input": "#search-text",
+  "submit": "",
+  "results_table": "#ctl00_ctl00_contentMain_contentMain_grdDetail_grdDetail_ctl00",
+  "data_rows": ":scope > tbody > tr.rgRow, :scope > tbody > tr.rgAltRow",
+  "column_headers": [
+    "Status", "Claim Status", "Patient Full Name", "Patient Last Name",
+    "Patient First Name", "Provider Code", "NPI", "Beneficiary ID", "PCN", "MRN",
+    "TOB", "Admit Date", "Stmt Start", "Stmt End", "Received Date", "Total Charges",
+    "Provider Reimb", "Paid Date", "Primary Reason", "DCN", "Cross Reference DCN",
+    "Cancel Date", "Is Adjustable", "Is Suppressed"
+  ],
+  "ready": "#ctl00_ctl00_contentMain_contentMain_grdDetail_grdDetail_ctl00:has(tr.rgRow, tr.rgAltRow):visible, #emptyGridHeader:text-is('No records to display.'):visible",
+  "no_results": "#emptyGridHeader:text-is('No records to display.'):visible",
+  "busy": "",
+  "reason_tooltip": "",
+  "next_page": "",
+  "headers": {}
+}

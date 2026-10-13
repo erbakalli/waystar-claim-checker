@@ -1,0 +1,35 @@
+# Local runtime, build artifacts and tooling
+**/.venv/
+**/__pycache__/
+*.py[cod]
+**/*.egg-info/
+**/build/
+**/dist/
+**/.kantime-build/
+.github-tools/
+**/.pytest_cache/
+
+# Private input, reports, logs and browser/session state
+outputs/
+*.xlsx
+*.xls
+*.csv
+*.pdf
+*.png
+*.log
+*.sqlite*
+*.db
+**/profiles/
+**/runs/
+**/*Output/
+**/portal-profile.json
+.env
+.env.*
+**/.aws/
+**/.codex/
+
+# Editor / OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
