@@ -6,14 +6,24 @@ Programi perdor vetem automatizimin live te Waystar.
 
 Hap Run Claims.cmd. Ai nis dist/Waystar Claim Checker.exe.
 Nuk kerkohet Python per executable-in. Microsoft Edge duhet te jete i instaluar.
+Nese Edge i automatizimit eshte ende i hapur, programi rigjen porten e profilit te vet
+dhe rilidhet me te edhe kur mungon skedari lokal i lidhjes; browser-i personal nuk perdoret.
 
 1. Zgjidh workbook-un te Receivables Excel.
+   Vetem Invoice No / Invoice Number / InvoiceNumber eshte kolone e detyrueshme.
+   Insurance ID, datat, Invoice Amount dhe Comments jane opsionale; kerkimi perdor PCN.
+   Ne rezultatet e portalit, Beneficiary ID, DCN dhe Claim Status mund te jene bosh.
+   Rreshtat pranohen kur PCN perputhet me kerkimin; fushat qe mungojne mbeten bosh ne output.
 2. Kliko Open Browser dhe kryej login/MFA ne Waystar.
+   Open Browser punon edhe pa Excel te zgjedhur; hap dritare edhe kur Edge eshte tashme aktiv.
+   Excel-i pergatitet kur klikon Start Automation dhe login-i ruhet kur ndryshon raporti.
 3. Kliko Start Automation. End Automation ndalon ne menyre te sigurt.
 
 Programi kerkon Invoice No ne menyren PCN dhe lexon te gjitha claim-et e kthyera.
 Kerkimet e njepasnjeshme perdorin search-in lart ne te njejten faqe rezultatesh.
-Faqja e integrimit hapet ne fillim ose gjate rikuperimit kur search-i mungon.
+Nisja perdor faqen Claims ekzistuese kur search-i eshte gati, edhe kur ndryshon raporti.
+Faqja e integrimit rihapet vetem kur search-i mungon ose duhet rikuperim.
+Log-u tregon pergatitjen e search-it, leximin e Account dhe nisjen e faturave.
 Programi pret ndryshimin e rezultateve perpara leximit; rezultatet e vjetra nuk pranohen.
 Rezultatet duhet te jene te qendrueshme perpara leximit. Gabimet e leximit riprovohen deri ne 3 here.
 Nese nje fature nuk lexohet, mbetet Retry later dhe gabimi shfaqet te LastError;
@@ -32,7 +42,12 @@ Claims ka vija ndarese te holla gri rreth cdo qelize, perfshire qelizat bosh.
 Kur nje fature ka te pakten nje claim me status Suspense, AutomationStatus shfaq Pending.
 VisitDate tregon periudhen Stmt Start - Stmt End ne formatin MM/DD/YYYY - MM/DD/YYYY.
 Visit/Supply/Expense merr Total Charges nga Waystar.
-InvoiceNumber merr PCN nga portali; pa rezultate nga portali mbetet bosh.
+InvoiceNumber merr PCN nga portali kur gjenden claim-e.
+Kur kerkimi kthen Not Found, Claims shfaq te dhenat e pacientit dhe fatures nga input-i:
+emrin, Invoice No, Insurance ID / Patient ID, DOB, datat, shumen, balancen dhe shenimet qe jane te pranishme.
+Claim Status, Pay. Status dhe AutomationStatus tregojne Not Found.
+Note(s)/ Follow Up sqaron qe keto te dhena vijne nga input-i; fatura nuk numerohet si claim i gjetur.
+Fushat e pageses dhe identifikimit te claim-it nga portali mbeten bosh.
 Invoice Date merr Received Date. Amount merr Total Charges.
 PaidAmount dhe Paid Amount marrin Provider Reimb; mungesa e shumes mbetet bosh.
 Adj. dhe Balance jane Total Charges - Provider Reimb; kur mungon nje shume mbeten bosh.

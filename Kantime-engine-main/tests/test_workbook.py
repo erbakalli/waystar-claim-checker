@@ -131,6 +131,42 @@ class WorkbookSessionTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_export_preserves_literal_equals_text_in_headers_and_values(self):
+        source = self.root / "literal-text.csv"
+        source.write_text(
+            "Record ID,Comments,Portal Value,=Source Header\n"
+            "=SOURCE-ID,=source comment,=old value,=source note\n",
+            encoding="utf-8",
+        )
+        original_hash = _sha256(source)
+        session = self._session()
+        try:
+            session.prepare(str(source))
+            batch_id, _ = session.begin_batch(1)
+            record = session.claim_next(batch_id)
+            self.assertIsNotNone(record)
+            session.commit(record, RowResult(
+                RowDisposition.RESOLVED, comment="=literal comment",
+                values={"portal_value": "=literal portal value"},
+            ))
+            session.finish_batch()
+            output = session.export_report()
+            for data_only in (False, True):
+                with self.subTest(data_only=data_only):
+                    workbook = load_workbook(output, data_only=data_only)
+                    try:
+                        results = workbook["Results"]
+                        cells = {cell.value: cell for row in results for cell in row}
+                        for text in ("=Source Header", "=SOURCE-ID", "=source note",
+                                     "=literal comment", "=literal portal value"):
+                            self.assertIn(text, cells)
+                            self.assertEqual(cells[text].data_type, "s")
+                    finally:
+                        workbook.close()
+            self.assertEqual(_sha256(source), original_hash)
+        finally:
+            session.close()
+
     def test_csv_cp1252_delimiter_blank_rows_and_leading_zero_keys(self):
         source = self.root / "collection.csv"
         source.write_bytes(

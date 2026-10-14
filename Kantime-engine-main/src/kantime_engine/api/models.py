@@ -96,6 +96,7 @@ class ResultSheetSpec:
     processed_only_columns: tuple[str, ...] = ()
     cell_borders: bool = False
     pending_claim_statuses: tuple[str, ...] = ()
+    empty_result_factory: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ class WorkbookSpec:
     hide_source_results: bool = False
     compact_summary: bool = False
     save_copy_if_locked: bool = False
+    processing_revision: str = ""
 
     def column(self, key: str) -> ColumnSpec:
         for column in self.columns:

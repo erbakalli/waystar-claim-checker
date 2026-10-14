@@ -164,7 +164,13 @@ def parse_table(headers, rows, overrides=None, primary_reasons=None):
             service_date(value("paid_date")), identifier(value("dcn")),
             received_date=service_date(value("received_date")),
         )
-        if not claim.beneficiary_id or not (claim.claim_id or claim.dcn) or not claim.status:
+        if "invoice" in indexes:
+            # PCN is the identity for invoice searches. Other portal values may
+            # legitimately be absent and must remain blank in the export.
+            if not claim.invoice:
+                raise ValueError("Result row has an empty PCN")
+        elif not claim.beneficiary_id or not (claim.claim_id or claim.dcn) or not claim.status:
+            # Legacy tables without PCN still need enough identity for matching.
             raise ValueError("Result row has an empty identity or status")
         claims.append(claim)
     return claims

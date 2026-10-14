@@ -16,6 +16,7 @@ outputs/
 *.csv
 *.pdf
 *.png
+!waystar-claim-checker/src/waystar_claim_checker/assets/*.png
 *.log
 *.sqlite*
 *.db

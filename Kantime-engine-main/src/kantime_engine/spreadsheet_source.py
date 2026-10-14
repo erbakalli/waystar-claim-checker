@@ -234,6 +234,8 @@ def schema_hash(spec: WorkbookSpec, headers: tuple[Any, ...]) -> str:
             for column in spec.columns
         ],
     }
+    if spec.processing_revision:
+        payload["processing_revision"] = spec.processing_revision
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

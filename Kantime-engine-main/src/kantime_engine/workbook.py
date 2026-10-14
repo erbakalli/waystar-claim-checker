@@ -238,7 +238,7 @@ class WorkbookSession:
         ]
         if missing:
             raise WorkbookError("Missing required columns: " + ", ".join(missing))
-        if column_map.get(self.spec.anchor.key) is None:
+        if column_map.get(self.spec.anchor.key) is None and not self.spec.anchor.provision:
             raise WorkbookError(f"Column not found: {self.spec.anchor.header}")
 
     def _ingest(

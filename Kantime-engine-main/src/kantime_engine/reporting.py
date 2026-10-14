@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import textwrap
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 import uuid
 
 from openpyxl import Workbook, load_workbook
@@ -56,6 +56,14 @@ BODY_FONT = Font(name="Arial", size=10, color="1F2937")
 TITLE_FONT = Font(name="Arial", size=14, bold=True, color="1F2937")
 
 
+def _value_cell(sheet: Any, value: Any) -> Any:
+    cell = WriteOnlyCell(sheet, value=value)
+    if isinstance(value, str):
+        # Source and portal text are values, including literal leading '='.
+        cell.data_type = "s"
+    return cell
+
+
 def _matching_spec(header: Any, columns: tuple[ColumnSpec, ...]) -> ColumnSpec | None:
     normalized = normalize_header(header)
     for column in columns:
@@ -89,7 +97,10 @@ def _report_columns(headers: tuple[Any, ...], spec: WorkbookSpec) -> list[Report
         None,
     )
     if anchor_position is None:
-        raise ReportError(f"Column not found: {spec.anchor.header}")
+        if not spec.anchor.provision:
+            raise ReportError(f"Column not found: {spec.anchor.header}")
+        kept.append(ReportColumn(spec.anchor.header, None, spec.anchor))
+        anchor_position = len(kept) - 1
     additions = [
         ReportColumn(column.header, find_column_index(headers, column), column)
         for column in provisioned
@@ -266,7 +277,7 @@ def generate_report(
     summary.sheet_view.showGridLines = False
     summary.column_dimensions["A"].width = 24
     summary.column_dimensions["B"].width = 44
-    title = WriteOnlyCell(summary, value=f"{run.automation_name} Results")
+    title = _value_cell(summary, f"{run.automation_name} Results")
     title.font = TITLE_FONT
     summary.append([title])
     summary.append([])
@@ -315,11 +326,11 @@ def generate_report(
         if "Not captured" in statuses:
             summary_rows.append(("Earlier records", "Claim Status was not saved in earlier runs. New claim checks include the portal status."))
     for summary_index, (label, value) in enumerate(summary_rows, start=3):
-        left = WriteOnlyCell(summary, value=label)
+        left = _value_cell(summary, label)
         left.font = Font(name="Arial", size=10, bold=True, color="1F2937")
         left.fill = SUMMARY_FILL
         left.alignment = Alignment(vertical="center")
-        right = WriteOnlyCell(summary, value=value)
+        right = _value_cell(summary, value)
         right.font = BODY_FONT
         right.alignment = Alignment(vertical="top" if spec.compact_summary else "center",
                                     wrap_text=spec.compact_summary)
@@ -345,7 +356,7 @@ def generate_report(
         results.column_dimensions[get_column_letter(index)].width = width
     header_cells = []
     for column in columns:
-        cell = WriteOnlyCell(results, value=column.header)
+        cell = _value_cell(results, column.header)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -389,7 +400,7 @@ def generate_report(
         cells = []
         alternate = written_rows % 2 == 1
         for index, (value, column) in enumerate(zip(row_values, columns)):
-            cell = WriteOnlyCell(results, value=value)
+            cell = _value_cell(results, value)
             _style_body_cell(cell, column, alternate)
             if status_index == index:
                 fill = _status_fill(value)
@@ -426,7 +437,7 @@ def generate_report(
         detail_headers = []
         for index, column in enumerate(detail_columns, 1):
             detail.column_dimensions[get_column_letter(index)].width = widths[column.spec.key]
-            cell = WriteOnlyCell(detail, value=column.header)
+            cell = _value_cell(detail, column.header)
             cell.font = Font(name=sheet_spec.font_name, size=sheet_spec.font_size, bold=True, color="FFFFFF")
             cell.fill = PatternFill("solid", fgColor=sheet_spec.header_color)
             if sheet_spec.cell_borders:
@@ -445,6 +456,8 @@ def generate_report(
                             raise ReportError(f"Result sheet has conflicting values for shared column {key}")
                         shared_values[key] = value
         count = 0
+        source_iterator = iter(iter_source_rows(run.snapshot_path, layout)) if sheet_spec.empty_result_factory else None
+        source_current = next(source_iterator, None) if source_iterator is not None else None
         for persisted in store.iter_rows(run.id):
             records = persisted.result.get(sheet_spec.result_key, [])
             if not isinstance(records, list):
@@ -461,6 +474,16 @@ def generate_report(
                         in {status.casefold() for status in sheet_spec.pending_claim_statuses}
                         for record in records)):
                     combined["automation_status"] = "Pending"
+                if not records and persisted.status == "RESOLVED" and sheet_spec.empty_result_factory:
+                    while source_current is not None and source_current[0] < persisted.source_row:
+                        source_current = next(source_iterator, None)
+                    if source_current is None or source_current[0] != persisted.source_row:
+                        raise ReportError("Saved input row is missing from the source snapshot")
+                    source_data = dict(zip(headers, source_current[1]))
+                    fallback = sheet_spec.empty_result_factory(source_data, persisted.result)
+                    if not isinstance(fallback, Mapping):
+                        raise ReportError("Empty result factory must return a mapping")
+                    combined.update(fallback)
                 combined.setdefault("pcn", persisted.result.get("pcn"))
                 if persisted.status == "RETRY_LATER":
                     combined["last_error"] = persisted.comment or persisted.result.get("checker_comments")
@@ -483,9 +506,7 @@ def generate_report(
                     60 if sheet_spec.grouped_columns else 32,
                     _detail_row_height(row_values, detail_columns, widths))
                 for value, column in zip(row_values, detail_columns):
-                    cell = WriteOnlyCell(detail, value=value)
-                    if isinstance(value, str):
-                        cell.data_type = "s"
+                    cell = _value_cell(detail, value)
                     _style_body_cell(cell, column, count % 2 == 1 and not sheet_spec.grouped_columns)
                     cell.font = Font(name=sheet_spec.font_name, size=sheet_spec.font_size, color="1F2937")
                     if sheet_spec.cell_borders:
@@ -497,6 +518,8 @@ def generate_report(
                     cells.append(cell)
                 detail.append(cells)
                 count += 1
+        if source_iterator is not None:
+            source_iterator.close()
         detail.auto_filter.ref = f"A1:{get_column_letter(len(detail_columns))}{count + 1}"
         status_column = next((i for i, c in enumerate(sheet_spec.columns, 1) if c.key == "claim_status"), None)
         if status_column and count:

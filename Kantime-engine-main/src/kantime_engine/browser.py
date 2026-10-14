@@ -52,6 +52,56 @@ def _cdp_version(endpoint: str, timeout: float = 1.0) -> dict[str, Any] | None:
         return None
 
 
+def _is_edge_cdp(info: Mapping[str, Any] | None) -> bool:
+    if not info:
+        return False
+    return any("Edg/" in str(info.get(key, "")) for key in ("Browser", "User-Agent"))
+
+
+def _running_edge_endpoint(profile_dir: Path) -> str | None:
+    """Recover the exact managed profile's endpoint if its marker was lost."""
+    if os.name != "nt":
+        return None
+    script = r'''
+    $ErrorActionPreference = 'Stop'
+    $items = @(Get-CimInstance Win32_Process -Filter "name = 'msedge.exe'" | ForEach-Object {
+        $line = $_.CommandLine
+        if ($line -and $line -notmatch '--type=' -and $line -match '--remote-debugging-port=(\d+)') {
+            $port = [int]$Matches[1]
+            if ($line -match '(?:"--user-data-dir=([^"]+)"|--user-data-dir="([^"]+)"|--user-data-dir=([^\s"]+))') {
+                $profile = $Matches[1]
+                if (-not $profile) { $profile = $Matches[2] }
+                if (-not $profile) { $profile = $Matches[3] }
+                [PSCustomObject]@{ profile = $profile; port = $port }
+            }
+        }
+    })
+    ConvertTo-Json -InputObject $items -Compress
+    '''
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode:
+            return None
+        records = json.loads(result.stdout)
+        for record in records:
+            if os.path.normcase(os.path.abspath(record["profile"])) != os.path.normcase(os.path.abspath(profile_dir)):
+                continue
+            port = int(record["port"])
+            if not 0 < port < 65536:
+                continue
+            endpoint = f"http://127.0.0.1:{port}"
+            info = _cdp_version(endpoint)
+            if _is_edge_cdp(info):
+                return endpoint
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 class BrowserActions:
     def __init__(
         self,
@@ -236,7 +286,7 @@ class BrowserSession:
             try:
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 endpoint = str(payload.get("endpoint", ""))
-                if endpoint and _cdp_version(endpoint):
+                if endpoint and _is_edge_cdp(_cdp_version(endpoint)):
                     return endpoint
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
@@ -248,11 +298,11 @@ class BrowserSession:
                     .splitlines()[0]
                 )
                 endpoint = f"http://127.0.0.1:{port}"
-                if _cdp_version(endpoint):
+                if _is_edge_cdp(_cdp_version(endpoint)):
                     return endpoint
             except (OSError, ValueError, IndexError):
                 pass
-        return None
+        return _running_edge_endpoint(self.profile_dir) if self.profile_dir is not None else None
 
     def _write_marker(self) -> None:
         marker = self._marker_path()
@@ -274,12 +324,46 @@ class BrowserSession:
     def is_cdp_ready(self) -> bool:
         if not self.endpoint:
             return False
-        info = _cdp_version(self.endpoint)
-        if not info:
-            return False
-        browser = str(info.get("Browser", ""))
-        agent = str(info.get("User-Agent", ""))
-        return "Edg/" in browser or "Edg/" in agent
+        return _is_edge_cdp(_cdp_version(self.endpoint))
+
+    def open_window(self) -> bool:
+        """Show a portal window, including when the managed Edge is already running.
+
+        Login happens before Playwright attaches. Edge forwards this disposable
+        launcher to the existing profile, so the original process ownership and
+        debugging endpoint remain unchanged.
+        """
+        self.cancellation.raise_if_cancelled()
+        launched = self.launch()
+        if launched:
+            return True
+        self.cancellation.raise_if_cancelled()
+        if self.profile_dir is None:
+            self.profile_dir = resolve_profile_dir(
+                self.app_paths.profiles, self.spec.profile_id, self.spec.legacy_profile_dir
+            )
+        args = [
+            find_edge_executable(),
+            f"--user-data-dir={self.profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            self.spec.start_url,
+        ]
+        kwargs: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["close_fds"] = True
+        try:
+            subprocess.Popen(args, **kwargs)
+        except OSError as exc:
+            raise BrowserSessionError(f"Could not open the managed Edge login window: {exc}") from exc
+        return False
 
     def launch(self) -> bool:
         """Launch a managed Edge without attaching Playwright, allowing extensions."""
@@ -291,6 +375,7 @@ class BrowserSession:
         existing = self._existing_profile_endpoint()
         if existing:
             self.endpoint = existing
+            self._write_marker()
             return False
         edge = find_edge_executable()
         last_error: Exception | None = None
@@ -331,6 +416,12 @@ class BrowserSession:
                         self._write_marker()
                         return True
                     if self.process.poll() is not None:
+                        existing = self._existing_profile_endpoint()
+                        if existing:
+                            self.endpoint = existing
+                            self.process = None
+                            self._write_marker()
+                            return False
                         break
                     self.cancellation.raise_if_cancelled()
                     time.sleep(0.25)
@@ -398,7 +489,9 @@ class BrowserSession:
         if self.context is None:
             raise BrowserSessionError("No browser context is attached")
         pages = self._open_pages(self.context)
-        match = next((page for page in pages if matcher(page)), None)
+        # Open Browser may create a fresh sign-in window. Prefer that recent
+        # portal tab over an older matching tab with an expired session.
+        match = next((page for page in reversed(pages) if matcher(page)), None)
         if match is not None:
             self.page = match
         elif self.page not in pages:

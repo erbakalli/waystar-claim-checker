@@ -7,4 +7,5 @@ source_dir = "src"
 entry_script = "src/waystar_claim_checker/__main__.py"
 executable_name = "Waystar Claim Checker"
 hidden_imports = []
-data = []
+icon = "src/waystar_claim_checker/assets/waystar.ico"
+data = [{source = "src/waystar_claim_checker/assets", destination = "waystar_claim_checker/assets"}]

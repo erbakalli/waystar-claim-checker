@@ -35,6 +35,8 @@ class EngineController:
         self._state = LifecycleState.IDLE
         self._state_lock = threading.Lock()
         self._session: RunSession | None = None
+        self._login_browser: BrowserSession | None = None
+        self._browser_first = False
         self._last_log_path: Path | None = None
         self._last_output_dir: Path | None = None
         self._tasks: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -78,6 +80,14 @@ class EngineController:
         self._set_state(LifecycleState.PREPARING)
         self._tasks.put(("prepare", dict(inputs)))
 
+    def open_browser(self, inputs: Mapping[str, Any]) -> None:
+        """Open the sign-in window independently of workbook preparation."""
+        if self.state in {LifecycleState.PREPARING, LifecycleState.EXPORTING, LifecycleState.RUNNING, LifecycleState.STOPPING}:
+            return
+        self.cancellation.reset()
+        self._set_state(LifecycleState.PREPARING)
+        self._tasks.put(("open_browser", dict(inputs)))
+
     def start(self, inputs: Mapping[str, Any]) -> None:
         if self.state != LifecycleState.READY:
             self.ui.show_error("Not ready", "Prepare the input file and browser first.")
@@ -112,6 +122,12 @@ class EngineController:
     def _logger(self) -> ExecutionLogger | None:
         return self._session.logger if self._session is not None else None
 
+    def _set_export_recovery(self, available: bool) -> None:
+        """Let applications with a hidden export button offer failure recovery."""
+        callback = getattr(self.ui, "set_export_recovery", None)
+        if callable(callback):
+            callback(available)
+
     def _user(self, message: str, level: str = "info", event: str = "user.message") -> None:
         logger = self._logger()
         if logger is not None:
@@ -129,8 +145,13 @@ class EngineController:
                 self._ensure_started()
                 if action == "prepare" and inputs is not None:
                     self._prepare(inputs)
+                elif action == "open_browser" and inputs is not None:
+                    self._open_browser(inputs)
                 elif action == "start" and inputs is not None:
-                    self._start(inputs)
+                    if self._browser_first:
+                        self._start_from_browser(inputs)
+                    else:
+                        self._start(inputs)
                 elif action == "export" and inputs is not None:
                     self._export(inputs)
                 elif action == "ui_action" and inputs is not None:
@@ -212,11 +233,47 @@ class EngineController:
         self.automation.validate_application_inputs(validated, variant)
         return variant, validated
 
-    def _prepare(self, inputs: Mapping[str, Any]) -> None:
+    def _open_browser(self, inputs: Mapping[str, Any]) -> None:
+        self.application.resolve(str(inputs.get("agency", "")), str(inputs.get("payer", "")))
+        self._browser_first = True
+        browser = self._session.browser if self._session is not None else self._login_browser
+        if browser is None:
+            browser = BrowserSession(
+                self.automation.spec.browser, self.cancellation, self.paths,
+                default_timeout_ms=self.automation.spec.run_policy.default_step_timeout_ms,
+            )
+            self._login_browser = browser
+        # Human sign-in takes place without an attached Playwright debugger.
+        browser.detach()
+        if self._session is not None:
+            self._session.context = None
+        self._user("Opening Microsoft Edge for Waystar sign-in...", event="browser.login_opening")
+        browser.open_window()
+        self.cancellation.raise_if_cancelled()
+        self._user(self.automation.spec.browser.login_instructions, event="browser.login_instructions")
+        self._set_state(LifecycleState.READY)
+
+    def _start_from_browser(self, inputs: Mapping[str, Any]) -> None:
+        variant, validated = self._validated(inputs)
+        session = self._session
+        if (session is None or variant != session.variant or
+                str(validated.get(self.automation.spec.source_field, "")) !=
+                str(session.inputs.get(self.automation.spec.source_field, ""))):
+            self._set_state(LifecycleState.PREPARING)
+            self._prepare(validated, preserve_browser=True)
+            self._set_state(LifecycleState.RUNNING)
+        self._start(validated)
+
+    def _prepare(self, inputs: Mapping[str, Any], *, preserve_browser: bool = False) -> None:
         variant = self.application.resolve(str(inputs.get("agency", "")), str(inputs.get("payer", "")))
         source = str(inputs.get(self.automation.spec.source_field, ""))
         layout = OutputLayout.for_source(source, variant.id, self.application.spec.output)
-        self._close_session("replaced")
+        retained_browser = (self._session.browser if preserve_browser and self._session is not None
+                            else self._login_browser)
+        self._close_session("replaced", close_browser=retained_browser is None)
+        if retained_browser is not None:
+            self._login_browser = retained_browser
+        self._set_export_recovery(False)
         logger = self._new_logger(layout, variant.id)
         browser: BrowserSession | None = None
         workbook: WorkbookSession | None = None
@@ -261,17 +318,20 @@ class EngineController:
                 f"Prepared {workbook.row_count} rows from {prepared.sheet_name}. The selected source file was not changed.",
                 "success", event="workbook.ready",
             )
-            browser = BrowserSession(
+            browser = retained_browser or BrowserSession(
                 self.automation.spec.browser,
                 self.cancellation,
                 self.paths,
                 logger,
                 self.automation.spec.run_policy.default_step_timeout_ms,
             )
+            browser.logger = logger
+            browser.actions.logger = logger
             logger.user("Opening a dedicated Microsoft Edge window...", event="browser.launching")
             launched = browser.launch()
             self.cancellation.raise_if_cancelled()
             self._session = RunSession(variant, validated, workbook, browser, logger, layout)
+            self._login_browser = None
             logger.info("browser.ready", "Managed Edge is ready", launched=launched)
             logger.user(self.automation.spec.browser.login_instructions, event="browser.login_instructions")
             self._set_state(LifecycleState.READY)
@@ -280,11 +340,14 @@ class EngineController:
                 logger.exception("prepare.failed", exc, "Application preparation failed")
             except Exception:
                 pass
-            if browser is not None:
+            if browser is not None and browser is not retained_browser:
                 try:
                     browser.close()
                 except Exception:
                     pass
+            if retained_browser is not None:
+                retained_browser.logger = None
+                retained_browser.actions.logger = None
             if workbook is not None:
                 workbook.close()
             try:
@@ -374,8 +437,10 @@ class EngineController:
                 f"Results report saved after {reason}: {output}",
                 "success", event="report.updated", report_path=str(output),
             )
+            self._set_export_recovery(False)
             return True
         except Exception as exc:
+            self._set_export_recovery(True)
             session.logger.exception("report.failed", exc, "Results report could not be updated")
             message = (
                 "Progress is safely stored, but the Results report could not be updated. "
@@ -417,7 +482,9 @@ class EngineController:
             output = workbook.export_report()
             self.automation.after_export(output, context)
             logger.user("Results report exported.", "success", event="export.completed", report_path=str(output))
+            self._set_export_recovery(False)
         except Exception as exc:
+            self._set_export_recovery(True)
             export_status = "export_failed"
             try:
                 logger.exception("export.failed", exc, "Results export failed")
@@ -430,12 +497,15 @@ class EngineController:
                 logger.close(export_status)
         self._set_state(LifecycleState.READY if self._session is not None else LifecycleState.IDLE)
 
-    def _close_session(self, status: str) -> None:
+    def _close_session(self, status: str, *, close_browser: bool = True) -> None:
         session = self._session
         if session is None:
             return
         try:
-            session.browser.close()
+            if close_browser:
+                session.browser.close()
+            else:
+                session.browser.detach()
         except Exception:
             pass
         try:
@@ -450,6 +520,12 @@ class EngineController:
 
     def _cleanup(self) -> None:
         self._close_session("application_closed")
+        if self._login_browser is not None:
+            try:
+                self._login_browser.close()
+            except Exception:
+                pass
+            self._login_browser = None
         try:
             self.automation.shutdown()
         except Exception:

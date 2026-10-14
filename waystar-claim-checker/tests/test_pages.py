@@ -13,10 +13,31 @@ for folder in (ROOT / "src", ROOT.parent / "Kantime-engine-main" / "src"):
 
 from kantime_engine import PortalAutomationError, RecoveryAction, RetryScope
 from kantime_engine.cancellation import CancellationRequested
-from waystar_claim_checker.pages import ClaimsPage, CLAIMS_URL
+from waystar_claim_checker.pages import ClaimsPage, CLAIMS_URL, _SearchRequests
 
 
 class PortalTests(unittest.TestCase):
+    def test_open_reuses_signed_in_claims_page_for_another_workbook(self):
+        adapter, locators = self.adapter()
+        locators["#search"].is_visible.return_value = True
+        adapter.open()
+        adapter.context.actions.goto.assert_not_called()
+        self.assertEqual(adapter.context.actions.click.call_args_list,
+                         [call(locators["#search-mode"]), call(locators["#pcn"])])
+
+    def test_open_reuses_signed_in_embedded_claims(self):
+        adapter, locators, outer, frame = self.embedded_adapter()
+        locators["#search"].is_visible.return_value = True
+        adapter.open()
+        adapter.context.actions.goto.assert_not_called()
+        self.assertIs(adapter.page, frame)
+
+    def test_open_recovers_when_claims_search_is_missing(self):
+        adapter, locators = self.adapter()
+        adapter.open()
+        adapter.context.actions.goto.assert_called_once_with(
+            adapter.context.page, CLAIMS_URL, timeout_ms=60_000)
+
     def test_office_is_read_from_account_heading_without_account_number(self):
         adapter, locators = self.adapter()
         body = Mock()
@@ -90,10 +111,40 @@ class PortalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.read_table(table)
 
+    def test_pcn_results_allow_missing_beneficiary_dcn_or_status(self):
+        for missing in ((7,), (19,), (1,), (7, 19, 1)):
+            with self.subTest(missing=missing):
+                adapter, table, rows = self.split_header_table()
+                for index in missing:
+                    rows[0][index] = ""
+                claims = adapter.read_table(table)
+                self.assertEqual(len(claims), 3)
+                self.assertEqual(claims[0].invoice, "TEST-PCN")
+                self.assertEqual(claims[0].billed, Decimal("100.01"))
+                if 7 in missing:
+                    self.assertEqual(claims[0].beneficiary_id, "")
+                if 19 in missing:
+                    self.assertEqual(claims[0].dcn, "")
+                if 1 in missing:
+                    self.assertEqual(claims[0].status, "")
+
+    def test_pcn_results_still_reject_missing_pcn(self):
+        adapter, table, rows = self.split_header_table()
+        rows[0][8] = ""
+        with self.assertRaisesRegex(ValueError, "empty PCN"):
+            adapter.read_table(table)
+
     def test_split_header_empty_table_needs_explicit_no_results(self):
         adapter, table, _ = self.split_header_table()
         table.locator.return_value.all.return_value = []
         with self.assertRaises(ValueError):
+            adapter.read_table(table)
+
+    def test_all_blank_data_rows_are_not_exported_as_not_found(self):
+        adapter, table, rows = self.split_header_table()
+        for cells in rows:
+            cells[:] = [""] * len(cells)
+        with self.assertRaisesRegex(ValueError, "Result rows are empty"):
             adapter.read_table(table)
 
     def adapter(self):
@@ -105,9 +156,17 @@ class PortalTests(unittest.TestCase):
             locator.is_visible.return_value = False
             locator.count.return_value = 1
             locator.first = locator
+            locator.all.return_value = [locator]
+            locator.evaluate.return_value = False
+        locators["#results"].evaluate.return_value = dict(
+            pager_texts=[], pager_present=False, navigation_enabled=False, page_count=None,
+            page_index=None, metadata_error=False, row_count=None)
         page = Mock(url="https://claimseditor.ecorpnet.com/member/SelectSummary.aspx", frames=[])
+        page.evaluate.return_value = dict(active=False, completed=0, failed=False)
         page.locator.side_effect = lambda selector: locators[selector]
         context = SimpleNamespace(page=page, actions=Mock(), cancellation=Mock())
+        context.actions.fill.side_effect = lambda locator, value: setattr(
+            locator.input_value, "return_value", str(value))
         context.actions.wait_for_any.return_value = "search"
         return ClaimsPage(context, profile), locators
 
@@ -284,6 +343,8 @@ class PortalTests(unittest.TestCase):
             return "completed"
         adapter.context.actions.wait_for_any.side_effect = wait
         with patch.object(adapter, "select_pcn") as selected, \
+                patch.object(adapter, "postback_state", side_effect=[
+                    dict(active=False, completed=n, failed=False) for n in (0, 1, 1, 1, 1, 2, 2, 2)]), \
                 patch.object(adapter, "result_snapshot", side_effect=["old", "old", "new", "new", "new", "new", "newer", "newer"]):
             self.assertEqual(adapter.search("INV-01"), [])
             self.assertEqual(adapter.search("INV-02"), [])
@@ -291,6 +352,113 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(adapter.context.actions.fill.call_args_list,
                          [call(locators["#search"], "INV-01"), call(locators["#search"], "INV-02")])
         adapter.context.actions.goto.assert_not_called()
+
+    def test_changed_grid_with_unchanged_empty_marker_is_not_completion(self):
+        adapter, locators = self.adapter()
+        locators["#completed"].is_visible.return_value = True
+        locators["#empty"].is_visible.return_value = True
+        locators["#search"].is_visible.return_value = True
+        previous = ["document", ["old-table", ""], ["old-empty", "No records"]]
+        interim = ["document", ["new-table", ""], ["old-empty", "No records"]]
+        def wait(outcomes, **kwargs):
+            self.assertFalse(outcomes["completed"]())
+            self.assertFalse(outcomes["completed"]())
+            raise TimeoutError("No verified completion")
+        adapter.context.actions.wait_for_any.side_effect = wait
+        with patch.object(adapter, "select_pcn"), \
+                patch.object(adapter, "result_snapshot", side_effect=[previous, interim, interim]), \
+                self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-ID")
+        self.assertEqual(caught.exception.reason, "unrecognized_results")
+        self.assertEqual(adapter.context.page.remove_listener.call_count, 3)
+
+    def test_new_empty_marker_without_search_completion_is_not_not_found(self):
+        adapter, locators = self.adapter()
+        locators["#completed"].is_visible.return_value = True
+        locators["#empty"].is_visible.return_value = True
+        locators["#search"].is_visible.return_value = True
+        previous = ["document", ["old-table", ""], ["old-empty", "No records"]]
+        interim = ["document", ["new-table", ""], ["new-empty", "No records"]]
+        def wait(outcomes, **kwargs):
+            self.assertFalse(outcomes["completed"]())
+            self.assertFalse(outcomes["completed"]())
+            raise TimeoutError("No verified search completion")
+        adapter.context.actions.wait_for_any.side_effect = wait
+        with patch.object(adapter, "select_pcn"), \
+                patch.object(adapter, "result_snapshot", side_effect=[previous, interim, interim]), \
+                self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-ID")
+        self.assertEqual(caught.exception.reason, "unrecognized_results")
+
+    def test_failed_asp_net_postback_is_retryable_instead_of_not_found(self):
+        adapter, locators = self.adapter()
+        locators["#completed"].is_visible.return_value = True
+        locators["#empty"].is_visible.return_value = True
+        locators["#search"].is_visible.return_value = True
+        def wait(outcomes, **kwargs):
+            self.assertFalse(outcomes["completed"]())
+            self.assertTrue(outcomes["request_failed"]())
+            return "request_failed"
+        adapter.context.actions.wait_for_any.side_effect = wait
+        with patch.object(adapter, "select_pcn"), \
+                patch.object(adapter, "postback_state", side_effect=[
+                    dict(active=False, completed=0, failed=False),
+                    dict(active=False, completed=1, failed=True)]), \
+                self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-ID")
+        self.assertEqual(caught.exception.retry_scope, RetryScope.CURRENT_ROW)
+        self.assertIn("Search request failed", str(caught.exception))
+
+    def test_query_changed_while_waiting_is_not_exported(self):
+        adapter, locators = self.adapter()
+        locators["#empty"].is_visible.return_value = True
+        adapter.context.actions.press.side_effect = lambda *_: setattr(
+            locators["#search"].input_value, "return_value", "OTHER-PCN")
+        with patch.object(adapter, "open"), self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-PCN")
+        self.assertIn("A different query was entered", str(caught.exception))
+
+    def test_search_request_lifecycle_ignores_other_frames_and_assets(self):
+        top, surface = Mock(), Mock()
+        relevant = Mock(frame=surface, resource_type="xhr")
+        relevant.response.return_value.status = 200
+        other = Mock(frame=Mock(), resource_type="fetch")
+        asset = Mock(frame=surface, resource_type="image")
+        with _SearchRequests(top, surface) as requests:
+            requests.started(other)
+            requests.started(asset)
+            self.assertFalse(requests.observed)
+            requests.started(relevant)
+            self.assertFalse(requests.completed)
+            requests.finished(relevant)
+            self.assertTrue(requests.completed)
+        self.assertEqual(top.on.call_count, 3)
+        self.assertEqual(top.remove_listener.call_count, 3)
+
+    def test_search_request_lifecycle_tracks_replacement_claims_frame(self):
+        top, old, replacement = Mock(), Mock(), Mock()
+        request = Mock(frame=replacement, resource_type="xhr")
+        request.response.return_value.status = 200
+        with _SearchRequests(top, old, lambda: replacement) as requests:
+            requests.started(request)
+            self.assertTrue(requests.observed)
+            requests.finished(request)
+            self.assertTrue(requests.completed)
+
+    def test_http_and_network_failures_do_not_confirm_empty_search(self):
+        for failure in ("http", "network"):
+            with self.subTest(failure=failure):
+                top, surface = Mock(), Mock()
+                relevant = Mock(frame=surface, resource_type="fetch")
+                relevant.response.return_value.status = 500
+                with _SearchRequests(top, surface) as requests:
+                    requests.started(relevant)
+                    if failure == "http":
+                        requests.finished(relevant)
+                    else:
+                        requests.request_failed(relevant)
+                    self.assertTrue(requests.failed)
+                    self.assertFalse(requests.completed)
 
     def test_selected_pcn_is_reused_without_opening_dropdown(self):
         adapter, locators = self.adapter()
@@ -328,7 +496,8 @@ class PortalTests(unittest.TestCase):
         outcomes = adapter.context.actions.wait_for_any.call_args.args[0]
         locators["#completed"].count.return_value = 2
         locators["#completed"].is_visible.return_value = True
-        with patch.object(adapter, "result_snapshot", return_value="new document"):
+        with patch.object(adapter, "result_snapshot", return_value="new document"), \
+                patch.object(adapter, "postback_state", return_value=dict(active=False, completed=1, failed=False)):
             self.assertFalse(outcomes["completed"]())
             self.assertTrue(outcomes["completed"]())
 
@@ -347,6 +516,41 @@ class PortalTests(unittest.TestCase):
             adapter.search("TEST-ID")
         self.assertEqual(caught.exception.retry_scope, RetryScope.NEXT_RUN)
         self.assertEqual(caught.exception.reason, "paginated_results")
+
+    def test_shipped_empty_next_page_selector_still_checks_pagination(self):
+        adapter, locators = self.adapter()
+        adapter.profile["next_page"] = ""
+        locators["#results"].is_visible.return_value = True
+        locators["#results"].evaluate.return_value.update(
+            pager_texts=["Page 1 of 2, items 1 to 10 of 15"], pager_present=True, row_count=10)
+        with patch.object(adapter, "open"), patch.object(adapter, "read_table") as read, \
+                self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-PCN")
+        self.assertEqual(caught.exception.reason, "paginated_results")
+        self.assertEqual(caught.exception.retry_scope, RetryScope.NEXT_RUN)
+        read.assert_not_called()
+
+    def test_recognized_pager_without_completeness_evidence_is_deferred(self):
+        adapter, locators = self.adapter()
+        adapter.profile["next_page"] = ""
+        locators["#results"].is_visible.return_value = True
+        locators["#results"].evaluate.return_value.update(pager_texts=["Choose a page"], pager_present=True)
+        with patch.object(adapter, "open"), patch.object(adapter, "read_table") as read, \
+                self.assertRaises(PortalAutomationError) as caught:
+            adapter.search("TEST-PCN")
+        self.assertEqual(caught.exception.reason, "pagination_unverified")
+        self.assertEqual(caught.exception.retry_scope, RetryScope.NEXT_RUN)
+        read.assert_not_called()
+
+    def test_disabled_configured_next_control_does_not_reject_complete_grid(self):
+        adapter, locators = self.adapter()
+        locators["#results"].is_visible.return_value = True
+        locators["#next"].is_visible.return_value = True
+        locators["#next"].is_enabled.return_value = False
+        locators["#results"].evaluate.return_value.update(
+            pager_texts=["Page 1 of 1, items 1 to 3 of 3"], pager_present=True, row_count=3)
+        with patch.object(adapter, "open"), patch.object(adapter, "read_table", return_value=["claims"]):
+            self.assertEqual(adapter.search("TEST-PCN"), ["claims"])
 
     def test_cancellation_propagates_without_becoming_portal_error(self):
         adapter, locators = self.adapter()

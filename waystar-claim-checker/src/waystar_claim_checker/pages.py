@@ -14,6 +14,63 @@ CLAIMS_URL = (
 )
 
 
+class _SearchRequests:
+    """Observe this Claims frame's search traffic without retaining query data."""
+
+    def __init__(self, top, surface, resolve_surface=None):
+        self.top = top
+        self.frame = top.main_frame if surface is top else surface
+        self.resolve_surface = resolve_surface
+        self.pending = set()
+        self.observed = False
+        self.failed = False
+        self.listeners = (("request", self.started), ("requestfinished", self.finished),
+                          ("requestfailed", self.request_failed))
+
+    def __enter__(self):
+        for name, listener in self.listeners:
+            self.top.on(name, listener)
+        return self
+
+    def __exit__(self, *_):
+        for name, listener in self.listeners:
+            self.top.remove_listener(name, listener)
+
+    def started(self, request):
+        try:
+            surface = self.resolve_surface() if self.resolve_surface else None
+            current_frame = self.top.main_frame if surface is self.top else surface
+            relevant = (request.frame in (self.frame, current_frame)
+                        and request.resource_type in ("document", "xhr", "fetch"))
+        except Exception:
+            # Service-worker requests have no frame and cannot prove completion
+            # of the selected Claims grid.
+            return
+        if relevant:
+            self.observed = True
+            self.pending.add(request)
+
+    def finished(self, request):
+        if request not in self.pending:
+            return
+        self.pending.discard(request)
+        try:
+            response = request.response()
+            if response is None or not 200 <= response.status < 400:
+                self.failed = True
+        except Exception:
+            self.failed = True
+
+    def request_failed(self, request):
+        if request in self.pending:
+            self.pending.discard(request)
+            self.failed = True
+
+    @property
+    def completed(self):
+        return self.observed and not self.pending and not self.failed
+
+
 def load_profile(path):
     try:
         profile = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
@@ -90,8 +147,18 @@ class ClaimsPage:
         )
 
     def open(self):
-        # Open the integration only during initial setup or recovery.
-        self.context.actions.goto(self.context.page, CLAIMS_URL, timeout_ms=60_000)
+        # Keep the signed-in Claims page when another workbook/batch starts.
+        # Re-entering SSO here can replace a working frame and stall startup.
+        search_ready = False
+        try:
+            search_ready = not self.signed_out() and self.page.locator(
+                self.profile["search_input"]
+            ).is_visible()
+        except Exception:
+            # A detached frame needs the normal integration recovery path.
+            pass
+        if not search_ready:
+            self.context.actions.goto(self.context.page, CLAIMS_URL, timeout_ms=60_000)
         self.select_pcn()
 
     def read_office(self):
@@ -171,35 +238,75 @@ class ClaimsPage:
         try:
             search = self.page.locator(self.profile["search_input"])
             actions.fill(search, pcn)
+            if not self.search_matches(pcn):
+                raise ValueError("PCN query was not set before submitting the search")
             previous = self.result_snapshot()
-            if self.profile.get("submit"):
-                actions.click(self.page.locator(self.profile["submit"]))
-            else:
-                actions.press(search, "Enter")
+            previous_postback = self.postback_state()
             candidate = None
-            def completed():
-                nonlocal candidate
-                if not self.page.locator(self.profile["ready"]).first.is_visible():
-                    candidate = None
-                    return False
-                current = self.result_snapshot()
-                if current == previous:
-                    candidate = None
-                    return False
-                stable = current == candidate
-                candidate = current
-                return stable
-            stage = "wait_for_results"
-            outcome = actions.wait_for_any({
-                "completed": completed,
-                "login": self.login_visible,
-            })
+            busy_seen = False
+            postback_failed = False
+            last_wait_state = {}
+            with _SearchRequests(self.context.page, self.page, lambda: self.page) as requests:
+                if self.profile.get("submit"):
+                    actions.click(self.page.locator(self.profile["submit"]))
+                else:
+                    actions.press(search, "Enter")
+
+                def completed():
+                    nonlocal candidate, busy_seen, postback_failed
+                    postback = self.postback_state()
+                    postback_completed = postback["completed"] > previous_postback["completed"]
+                    postback_failed = postback_completed and postback["failed"]
+                    busy = self.profile.get("busy")
+                    if busy and self.page.locator(busy).is_visible():
+                        busy_seen = True
+                        candidate = None
+                        return False
+                    # A browser call must run even while traffic is pending so
+                    # synchronous Playwright can dispatch finished/failed events.
+                    ready = self.page.locator(self.profile["ready"]).first.is_visible()
+                    query_unchanged = self.submitted_query_unchanged(pcn)
+                    last_wait_state.update(ready=ready, pending_requests=len(requests.pending),
+                                          request_failed=requests.failed, postback_active=postback["active"],
+                                          query_unchanged=query_unchanged)
+                    if (requests.pending or requests.failed or postback["active"] or postback_failed
+                            or not ready or not query_unchanged):
+                        candidate = None
+                        return False
+                    current = self.result_snapshot()
+                    confirmed = requests.completed or busy_seen or postback_completed
+                    last_wait_state.update(completion_observed=confirmed, snapshot_changed=current != previous)
+                    if current == previous and not confirmed:
+                        candidate = None
+                        return False
+                    # A cleared/replaced table can appear long before its AJAX
+                    # result arrives. An old empty overlay proves nothing about
+                    # the new query. Require completed traffic, a busy cycle or
+                    # a completed ASP.NET postback before accepting no claims.
+                    empty = self.page.locator(self.profile["no_results"]).is_visible()
+                    if empty and not confirmed:
+                        candidate = None
+                        return False
+                    stable = current == candidate
+                    candidate = current
+                    return stable and not requests.pending and not requests.failed
+
+                stage = "wait_for_results"
+                outcome = actions.wait_for_any({
+                    "completed": completed,
+                    "login": self.login_visible,
+                    "request_failed": lambda: requests.failed or postback_failed,
+                })
             if outcome == "login":
                 raise self.reauth_error()
+            if outcome == "request_failed":
+                raise ValueError("Search request failed; no empty result was confirmed")
             if self.profile.get("busy"):
                 actions.wait_hidden(self.page.locator(self.profile["busy"]))
             if self.signed_out():
                 raise self.reauth_error()
+            if not self.submitted_query_unchanged(pcn):
+                raise ValueError("A different query was entered before results were read")
             stage = "read_results"
             table = self.page.locator(self.profile["results_table"])
             # The empty-result overlay can coexist with the visible grid table.
@@ -210,16 +317,9 @@ class ClaimsPage:
                 return []
             if not table.is_visible():
                 raise ValueError("Completed search has no recognized results")
-            # An incomplete result set cannot establish a unique match or absence.
-            if self.profile.get("next_page"):
-                next_page = self.page.locator(self.profile["next_page"])
-                if next_page.is_visible() and next_page.is_enabled():
-                    raise PortalAutomationError(
-                        "Search has more result pages. Refine the search or configure all-results view.",
-                        reason="paginated_results", retry_scope=RetryScope.NEXT_RUN,
-                    )
             if table.count() != 1:
                 raise ValueError("Multiple result tables")
+            self.verify_complete_results(table)
             return self.read_table(table)
         except (CancellationRequested, PortalAutomationError):
             raise
@@ -231,11 +331,159 @@ class ClaimsPage:
             if logger is not None:
                 logger.warning("search.read_failed", "Claim results could not be read",
                                stage=stage, error_type=type(exc).__name__, detail=detail)
+                if stage == "wait_for_results":
+                    logger.warning("search.wait_state", "Search completion indicators", **last_wait_state)
             raise PortalAutomationError(
                 f"Claim results could not be read ({detail}). This invoice needs another attempt.",
                 reason="unrecognized_results", recovery=RecoveryAction.BACKOFF,
                 retry_scope=RetryScope.CURRENT_ROW,
             ) from None
+
+    def search_matches(self, pcn):
+        """Do not export results after a user or the portal changes the query."""
+        surface = self.page
+        selected = self.profile.get("selected_pcn")
+        return (surface.locator(self.profile["search_input"]).input_value().strip().upper()
+                == str(pcn).strip().upper()
+                and (not selected or surface.locator(selected).is_visible()))
+
+    def submitted_query_unchanged(self, pcn):
+        """A result navigation may clear the input or reset its dropdown.
+
+        PCN mode and the full query are verified before submit. After submit,
+        only a different nonempty query means the requested search was changed.
+        Returned claim PCNs are still checked before committing any result.
+        """
+        search = self.page.locator(self.profile["search_input"])
+        if not search.count():
+            return True
+        value = search.input_value().strip().upper()
+        return not value or value == str(pcn).strip().upper()
+
+    def postback_state(self):
+        """Wait for ASP.NET's endRequest rather than just its response body."""
+        return self.page.evaluate("""() => {
+            const manager = window.Sys?.WebForms?.PageRequestManager?.getInstance?.();
+            if (!manager || typeof manager.get_isInAsyncPostBack !== 'function') {
+                return {active: false, completed: 0, failed: false};
+            }
+            let state = window.__waystarPostbackObserver;
+            if (!state || state.manager !== manager) {
+                state = {manager, completed: 0, failed: false};
+                window.__waystarPostbackObserver = state;
+                manager.add_endRequest((sender, args) => {
+                    state.completed += 1;
+                    state.failed = typeof args?.get_error === 'function' && !!args.get_error();
+                });
+            }
+            return {active: manager.get_isInAsyncPostBack(),
+                    completed: state.completed, failed: state.failed};
+        }""")
+
+    def verify_complete_results(self, table):
+        """Defer partial or unverified grids, even without a profile pager selector.
+
+        Telerik documents page count/current index on GridTableView and the
+        default pager's ``Page X of Y, items A to B of N`` text. Read those and
+        the current grid's controls; never navigate or change its page size.
+        """
+        self.context.cancellation.raise_if_cancelled()
+
+        def incomplete():
+            raise PortalAutomationError(
+                "Search has more result pages. Refine the search or configure all-results view.",
+                reason="paginated_results", retry_scope=RetryScope.NEXT_RUN,
+            )
+
+        if self.profile.get("next_page"):
+            # Top and bottom pagers can both match. HTML disabled attributes,
+            # ARIA and ASP.NET/Telerik disabled containers all suppress links.
+            for control in self.page.locator(self.profile["next_page"]).all():
+                if (control.is_visible() and control.is_enabled() and not control.evaluate(
+                    "element => !!element.closest('[disabled], [aria-disabled=\"true\"], .aspNetDisabled, .rgDisabled')"
+                )):
+                    incomplete()
+
+        state = table.evaluate("""(table, rowSelector) => {
+            const grid = table.closest('.RadGrid') || table;
+            const visible = element => !!element.getClientRects().length &&
+                getComputedStyle(element).visibility !== 'hidden';
+            const belongs = element => !element.closest('.RadGrid') ||
+                element.closest('.RadGrid') === grid;
+            const disabled = element => !!element.closest(
+                '[disabled], [aria-disabled="true"], .aspNetDisabled, .rgDisabled');
+            const pagers = [...grid.querySelectorAll('.rgPager, .rgPagerCell, .rgInfoPart')]
+                .filter(element => belongs(element) && visible(element));
+            const controls = [...grid.querySelectorAll(
+                '.rgPageNext, .rgPageLast, .rgPagePrev, .rgPageFirst, .rgNumPart a:not(.rgCurrentPage)')]
+                .filter(element => belongs(element) && visible(element));
+            const result = {
+                pager_texts: pagers.map(element => element.innerText),
+                pager_present: pagers.length > 0 || controls.length > 0,
+                navigation_enabled: controls.some(element => !disabled(element)),
+                page_count: null, page_index: null, metadata_error: false,
+                row_count: rowSelector ? table.querySelectorAll(rowSelector).length : null
+            };
+            if (typeof window.$find === 'function') {
+                try {
+                    let view = window.$find(table.id);
+                    if (!view || typeof view.get_pageCount !== 'function') {
+                        const owner = window.$find(grid.id);
+                        view = owner && typeof owner.get_masterTableView === 'function'
+                            ? owner.get_masterTableView() : null;
+                    }
+                    // A wrapper can also contain detail tables. Its master
+                    // view's metadata must describe this exact result table.
+                    if (view && typeof view.get_element === 'function' &&
+                            view.get_element() === table && typeof view.get_pageCount === 'function') {
+                        const count = view.get_pageCount();
+                        const index = typeof view.get_currentPageIndex === 'function'
+                            ? view.get_currentPageIndex() : null;
+                        if (!Number.isInteger(count) || count < 0 ||
+                                (index !== null && (!Number.isInteger(index) || index < 0))) {
+                            result.metadata_error = true;
+                        } else {
+                            result.page_count = count;
+                            result.page_index = index;
+                        }
+                    }
+                } catch (_) {
+                    result.metadata_error = true;
+                }
+            }
+            return result;
+        }""", self.profile.get("data_rows"))
+        if state["navigation_enabled"] or (state["page_count"] or 0) > 1 or (state["page_index"] or 0) > 0:
+            incomplete()
+        single_page = state["page_count"] == 1
+        unverified = False
+        row_count = state["row_count"]
+        for text in state["pager_texts"]:
+            pages = re.search(r"\bpage\s+([\d,]+)\s+of\s+([\d,]+)\b", text, re.IGNORECASE)
+            if pages:
+                current, total = (int(value.replace(",", "")) for value in pages.groups())
+                if current > 1 or total > 1:
+                    incomplete()
+                if current != 1 or total != 1:
+                    unverified = True
+                single_page = single_page or current == total == 1
+            items = re.search(r"\bitems?\s+([\d,]+)\s+to\s+([\d,]+)\s+of\s+([\d,]+)\b", text, re.IGNORECASE)
+            if items:
+                first, last, total = (int(value.replace(",", "")) for value in items.groups())
+                if first > 1 or last < total or (row_count is not None and total > row_count):
+                    incomplete()
+                if first < 1 or last < first or total < last or (row_count is not None and total < row_count):
+                    unverified = True
+                # Counts must agree with visible data rows before they can
+                # establish completeness without a page-count indicator.
+                if row_count is not None and first == 1 and last == total == row_count:
+                    single_page = True
+        if state["metadata_error"] or unverified or (state["pager_present"] and not single_page):
+            raise PortalAutomationError(
+                "The result grid has paging information whose completeness could not be verified. "
+                "Configure an all-results view or verify the pager before retrying this invoice.",
+                reason="pagination_unverified", retry_scope=RetryScope.NEXT_RUN,
+            )
 
     def result_snapshot(self):
         """Distinguish a new document or replaced result nodes from stale results.
@@ -286,7 +534,10 @@ class ClaimsPage:
                 raise ValueError("Result row does not match table headers")
             reason_cell = row.locator("td").nth(indexes["primary_reason"])
             reasons.append(self.read_primary_reason(reason_cell, cells[indexes["primary_reason"]]))
-        return parse_table(headers, rows, self.profile.get("headers"), primary_reasons=reasons)
+        claims = parse_table(headers, rows, self.profile.get("headers"), primary_reasons=reasons)
+        if not claims:
+            raise ValueError("Result rows are empty without a verified empty-search message")
+        return claims
 
     def read_primary_reason(self, cell, code):
         """Read the tooltip description without exporting the displayed reason code."""
