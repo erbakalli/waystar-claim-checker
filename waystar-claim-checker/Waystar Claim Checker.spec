@@ -21,7 +21,7 @@ datas, binaries, hiddenimports = collect_all('playwright')
 hiddenimports += ['tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox', '_tkinter']
 datas += [(str(tcl), '_tcl_data'), (str(tk), '_tk_data')]
 assets = root / 'src' / 'waystar_claim_checker' / 'assets'
-datas += [(str(assets), 'waystar_claim_checker/assets')]
+datas += [(str(assets / 'waystar.ico'), 'waystar_claim_checker/assets')]
 a = Analysis(
     [str(root / 'src/waystar_claim_checker/__main__.py')],
     pathex=[str(root / 'src'), str(root.parent / 'Kantime-engine-main/src'),

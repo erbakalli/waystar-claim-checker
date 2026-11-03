@@ -10,7 +10,8 @@ import hashlib
 import json
 from pathlib import Path
 import os
-from typing import Any, Iterator
+import re
+from typing import Any, Iterator, Callable
 
 from openpyxl import load_workbook
 
@@ -27,10 +28,12 @@ SUPPORTED_EXTENSIONS = {".xlsx", ".csv"}
 def normalize_header(value: Any) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).strip().lower().split()).rstrip(".")
+    return re.sub(r"[_\s/#-]+", "", str(value)).lower().rstrip(".")
 
 
 def normalize_value(value: Any) -> str:
+    if hasattr(value, "iloc"):
+        value = value.iloc[0] if len(value) else None
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -42,7 +45,7 @@ def normalize_value(value: Any) -> str:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     text = str(value).strip()
-    return "" if text.lower() in {"nan", "none"} else text
+    return "" if text.lower() in {"nan", "nat", "none", "null"} else text
 
 
 def validate_extension(path: str | Path) -> str:
@@ -67,7 +70,22 @@ class SourceLayout:
     delimiter: str | None = None
 
 
-def _select_sheet(names: list[str], variant: VariantSpec) -> str:
+def _select_sheet(names: list[str], variant: VariantSpec,
+                  sheet_decider: Callable[[tuple[str, ...]], str | None] | None = None) -> str:
+    if variant.sheet.name_aliases:
+        tokens = lambda name: tuple(re.findall(r"[^\W_]+", name.casefold()))
+        aliases = [tokens(alias) for alias in variant.sheet.name_aliases]
+        candidates = [name for name in names if not set(tokens(name)) & set(variant.sheet.exclude_tokens)
+                      and any(set(alias) <= set(tokens(name)) for alias in aliases)]
+        if len(candidates) == 1 and (not variant.sheet.confirm_match or sheet_decider is None):
+            return candidates[0]
+        if sheet_decider is not None:
+            chosen = sheet_decider(tuple(names))
+            if chosen in names:
+                return chosen
+            raise SpreadsheetSourceError("No worksheet selected. Select the worksheet to continue.")
+        raise SpreadsheetSourceError(
+            f"No unique worksheet matches {variant.payer}. Select the worksheet to use.")
     if variant.sheet.exact_name:
         target = normalize_header(variant.sheet.exact_name)
         for name in names:
@@ -112,7 +130,8 @@ def _csv_settings(path: Path) -> tuple[str, str]:
     return encoding, delimiter
 
 
-def inspect_source(path: str | Path, variant: VariantSpec) -> SourceLayout:
+def inspect_source(path: str | Path, variant: VariantSpec,
+                   sheet_decider: Callable[[tuple[str, ...]], str | None] | None = None) -> SourceLayout:
     resolved = Path(path).expanduser().resolve()
     extension = validate_extension(resolved)
     if extension == ".xlsx":
@@ -121,7 +140,7 @@ def inspect_source(path: str | Path, variant: VariantSpec) -> SourceLayout:
         except Exception as exc:
             raise SpreadsheetSourceError(f"Could not read XLSX file: {exc}") from exc
         try:
-            sheet_name = _select_sheet(list(workbook.sheetnames), variant)
+            sheet_name = _select_sheet(list(workbook.sheetnames), variant, sheet_decider)
             worksheet = workbook[sheet_name]
             for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
                 if any(normalize_header(value) for value in row):
@@ -204,6 +223,12 @@ def iter_source_rows(
 
 
 def find_column_index(headers: tuple[Any, ...], spec: ColumnSpec) -> int | None:
+    for candidate in spec.accepted_headers:
+        for index, header in enumerate(headers):
+            if header == candidate:
+                return index
+    if spec.exact_match:
+        return None
     accepted = {normalize_header(header) for header in spec.accepted_headers}
     for index, header in enumerate(headers):
         normalized = normalize_header(header)
@@ -219,6 +244,7 @@ def map_columns(headers: tuple[Any, ...], spec: WorkbookSpec) -> dict[str, int |
 def schema_hash(spec: WorkbookSpec, headers: tuple[Any, ...]) -> str:
     payload = {
         "key": spec.key_column,
+        "preserve_source_workbook": spec.preserve_source_workbook,
         "headers": [normalize_header(value) for value in headers],
         "columns": [
             {
@@ -230,12 +256,15 @@ def schema_hash(spec: WorkbookSpec, headers: tuple[Any, ...]) -> str:
                 "provision": column.provision,
                 "anchor": column.anchor,
                 "format": column.format.value,
+                "exact_match": column.exact_match,
             }
             for column in spec.columns
         ],
     }
     if spec.processing_revision:
         payload["processing_revision"] = spec.processing_revision
+    if spec.resume_result_factory is not None:
+        payload["resume_from_source"] = True
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

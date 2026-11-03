@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+import http.client
 import json
+import logging
 import os
 import shutil
 import socket
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -43,12 +44,26 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _cdp_json(endpoint: str, path: str, timeout: float = 1.0) -> Any:
+    """Read local Edge HTTP without initializing unrelated HTTPS/SSL handlers."""
+    address = urlsplit(endpoint)
+    connection = http.client.HTTPConnection(address.hostname, address.port, timeout=timeout)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise OSError(f"Edge CDP returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+
+
 def _cdp_version(endpoint: str, timeout: float = 1.0) -> dict[str, Any] | None:
     try:
-        with urllib.request.urlopen(f"{endpoint}/json/version", timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return payload if isinstance(payload, dict) else None
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        payload = _cdp_json(endpoint, "/json/version", timeout)
+        return payload if isinstance(payload, dict) else None
+    except (http.client.HTTPException, TimeoutError, OSError, ValueError):
+        logging.getLogger(__name__).debug("Edge CDP probe failed at %s", endpoint, exc_info=True)
         return None
 
 
@@ -204,11 +219,12 @@ class BrowserActions:
         self.cancellation.raise_if_cancelled()
         locator.press(key, timeout=timeout)
 
-    def goto(self, page: Any, url: str, timeout_ms: int | None = None) -> Any:
+    def goto(self, page: Any, url: str, timeout_ms: int | None = None,
+             *, wait_until: str = "domcontentloaded") -> Any:
         self.cancellation.raise_if_cancelled()
         return page.goto(
             url,
-            wait_until="domcontentloaded",
+            wait_until=wait_until,
             timeout=timeout_ms or self.default_timeout_ms,
         )
 
@@ -269,6 +285,44 @@ class BrowserSession:
         self.page: Any = None
         self._owner_thread: int | None = None
         self._previous_page: Any = None
+        self.status_callback: Callable[[str], None] | None = None
+
+    @staticmethod
+    def _surface_url(surface: Any) -> str:
+        reported = str(surface.url or "")
+        if reported not in ("", "about:blank"):
+            return reported
+        try:
+            actual = surface.evaluate("() => location.href")
+            return actual if isinstance(actual, str) else reported
+        except Exception:
+            return reported
+
+    def _status(self, message: str) -> None:
+        if self.status_callback is not None:
+            self.status_callback(message)
+
+    def _login_page_visible(self, page: Any) -> bool:
+        for surface in (page, *page.frames):
+            try:
+                url = self._surface_url(surface).lower()
+                if (any(pattern.lower() in url for pattern in self.spec.login_url_patterns)
+                        and surface.locator('body').is_visible()):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _portal_ready(self, page: Any) -> bool:
+        for surface in (page, *page.frames):
+            try:
+                url = self._surface_url(surface).lower()
+                if (any(pattern.lower() in url for pattern in self.spec.page_url_patterns)
+                        and surface.locator(self.spec.ready_selector).first.is_visible()):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def matches_page(self, page: Any) -> bool:
         try:
@@ -322,18 +376,77 @@ class BrowserSession:
                 pass
 
     def is_cdp_ready(self) -> bool:
+        if self.spec.existing_edge_user_data_dir:
+            try:
+                if self.browser is not None and self.browser.is_connected():
+                    return True
+                endpoint = self._personal_edge_endpoint()
+                if self.endpoint != endpoint:
+                    return False
+                address = urlsplit(endpoint)
+                with socket.create_connection((address.hostname, address.port), timeout=0.5):
+                    return True
+            except (OSError, BrowserSessionError):
+                return False
         if not self.endpoint:
             return False
         return _is_edge_cdp(_cdp_version(self.endpoint))
 
+    def _personal_edge_endpoint(self) -> str:
+        folder = Path(os.path.expandvars(self.spec.existing_edge_user_data_dir)).expanduser()
+        try:
+            lines = (folder / 'DevToolsActivePort').read_text(encoding='utf-8').splitlines()
+            port = int(lines[0].strip())
+            path = lines[1].strip()
+            if not 0 < port < 65536 or not path.startswith('/devtools/browser/'):
+                raise ValueError('Invalid browser endpoint')
+            if any(char.isspace() for char in path) or '#' in path or '?' in path:
+                raise ValueError('Invalid browser endpoint')
+            return f'ws://127.0.0.1:{port}{path}'
+        except (OSError, ValueError, IndexError):
+            raise BrowserSessionError(
+                'Open your usual Microsoft Edge, go to edge://inspect/#remote-debugging, '
+                'and enable "Allow remote debugging for this browser instance". '
+                'Then click Open Browser again and allow the connection if Edge asks.'
+            ) from None
+
     def open_window(self) -> bool:
-        """Show a portal window, including when the managed Edge is already running.
+        """Open a portal tab, including when the managed Edge is already running.
 
         Login happens before Playwright attaches. Edge forwards this disposable
         launcher to the existing profile, so the original process ownership and
         debugging endpoint remain unchanged.
         """
         self.cancellation.raise_if_cancelled()
+        if self.spec.existing_edge_user_data_dir:
+            self.launch()
+            page = self.attach(lambda item: self.matches_page(item) or self._login_page_visible(item))
+            # Make the tab visible before navigation, including slow SSO pages.
+            page.bring_to_front()
+            for attempt in range(2):
+                self.cancellation.raise_if_cancelled()
+                try:
+                    if attempt or not (self.matches_page(page) or self._login_page_visible(page)):
+                        self._status("Opening Waystar in your Edge tab...")
+                        self.actions.goto(page, self.spec.start_url, timeout_ms=20_000, wait_until="commit")
+                    if self.spec.ready_selector:
+                        self._status("Waiting for Waystar to show its search or sign-in page...")
+                        outcome = self.actions.wait_for_any({
+                            "ready": lambda: self._portal_ready(page),
+                            "login": lambda: self._login_page_visible(page),
+                        }, timeout_ms=20_000)
+                        self._status("Waystar is ready." if outcome == "ready" else
+                                     "Waystar sign-in is open. Complete login and MFA in this tab.")
+                    return False
+                except CancellationRequested:
+                    raise
+                except Exception:
+                    if attempt:
+                        raise BrowserSessionError(
+                            "Waystar did not finish opening after an automatic retry in the same tab. "
+                            "Check the connection or complete any sign-in request shown in Edge."
+                        ) from None
+                    self._status("Waystar is taking longer to open. Retrying automatically in the same tab...")
         launched = self.launch()
         if launched:
             return True
@@ -347,7 +460,6 @@ class BrowserSession:
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
-            "--new-window",
             self.spec.start_url,
         ]
         kwargs: dict[str, Any] = {
@@ -368,6 +480,9 @@ class BrowserSession:
     def launch(self) -> bool:
         """Launch a managed Edge without attaching Playwright, allowing extensions."""
         if self.is_cdp_ready():
+            return False
+        if self.spec.existing_edge_user_data_dir:
+            self.endpoint = self._personal_edge_endpoint()
             return False
         self.profile_dir = resolve_profile_dir(
             self.app_paths.profiles, self.spec.profile_id, self.spec.legacy_profile_dir
@@ -462,10 +577,16 @@ class BrowserSession:
         self.playwright = sync_playwright().start()
         self._owner_thread = threading.get_ident()
         try:
-            self.browser = self.playwright.chromium.connect_over_cdp(self.endpoint)
+            self.browser = self.playwright.chromium.connect_over_cdp(
+                self.endpoint, timeout=60_000 if self.spec.existing_edge_user_data_dir else 30_000)
         except Exception as exc:
             self.playwright.stop()
             self.playwright = None
+            if self.spec.existing_edge_user_data_dir:
+                raise BrowserSessionError(
+                    'Could not connect to your open Edge. Enable remote debugging at '
+                    'edge://inspect/#remote-debugging, then retry and allow the connection in Edge.'
+                ) from None
             raise BrowserSessionError(f"Playwright could not attach to {self.endpoint}: {exc}") from exc
         if not self.browser.contexts:
             raise BrowserSessionError("The CDP browser has no context")
@@ -494,6 +615,8 @@ class BrowserSession:
         match = next((page for page in reversed(pages) if matcher(page)), None)
         if match is not None:
             self.page = match
+        elif self.spec.existing_edge_user_data_dir and self.page not in pages:
+            self.page = self.context.new_page()
         elif self.page not in pages:
             ordinary_pages = []
             for page in pages:
@@ -566,6 +689,10 @@ class BrowserSession:
 
     def close(self) -> None:
         self._assert_thread()
+        if self.spec.existing_edge_user_data_dir:
+            self.detach()
+            self.endpoint = None
+            return
         if self.browser is not None:
             try:
                 self.browser.close()

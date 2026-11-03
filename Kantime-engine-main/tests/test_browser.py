@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,11 +13,131 @@ from tests import _bootstrap  # noqa: F401
 
 from tests.fakes import SPEC
 from kantime_engine.paths import ApplicationPaths
-from kantime_engine.browser import BrowserActions, BrowserSession, BrowserSessionError, _running_edge_endpoint
+from kantime_engine.browser import BrowserActions, BrowserSession, BrowserSessionError, _running_edge_endpoint, _cdp_version
 from kantime_engine.cancellation import CancellationRequested, CancellationToken
 
 
 class BrowserTests(unittest.TestCase):
+    def test_personal_edge_first_click_shows_tab_before_navigation_and_recovers_in_same_tab(self):
+        session = self.personal_session(Path('unused'))
+        session.spec = replace(session.spec, ready_selector='#search')
+        page = Mock(url='about:blank', frames=[])
+        session.status_callback = Mock()
+        def navigate(target, url, **kwargs):
+            self.assertIs(target, page)
+            page.bring_to_front.assert_called_once()
+            self.assertEqual(kwargs['wait_until'], 'commit')
+            page.url = url
+        with patch.object(session, 'launch'), patch.object(session, 'attach', return_value=page) as attach, \
+                patch.object(session.actions, 'goto', side_effect=navigate) as goto, \
+                patch.object(session.actions, 'wait_for_any', side_effect=[TimeoutError(), 'ready']):
+            self.assertFalse(session.open_window())
+        attach.assert_called_once()
+        self.assertEqual(goto.call_count, 2)
+        page.close.assert_not_called()
+        self.assertTrue(any('automatically' in call.args[0] for call in session.status_callback.call_args_list))
+
+    def test_personal_edge_existing_signin_tab_is_reused_without_reloading(self):
+        session = self.personal_session(Path('unused'))
+        session.spec = replace(session.spec, ready_selector='#search', login_url_patterns=('login.test',))
+        page = Mock(url='https://login.test/signin', frames=[])
+        page.locator.return_value.is_visible.return_value = True
+        with patch.object(session, 'launch'), patch.object(session, 'attach', return_value=page), \
+                patch.object(session.actions, 'goto') as goto, \
+                patch.object(session.actions, 'wait_for_any', return_value='login'):
+            self.assertFalse(session.open_window())
+        goto.assert_not_called()
+
+    def personal_session(self, folder):
+        spec = replace(SPEC.browser, existing_edge_user_data_dir=str(folder))
+        return BrowserSession(spec, CancellationToken(), ApplicationPaths('test', 'test', Path(folder)))
+
+    def test_personal_edge_uses_permission_websocket_without_launching_or_copying_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / 'DevToolsActivePort').write_text('43123\n/devtools/browser/test-token\n')
+            session = self.personal_session(folder)
+            with patch('kantime_engine.browser.subprocess.Popen') as popen, \
+                    patch('kantime_engine.browser.resolve_profile_dir') as profiles, \
+                    patch('kantime_engine.browser._cdp_version') as http:
+                self.assertFalse(session.launch())
+            self.assertEqual(session.endpoint, 'ws://127.0.0.1:43123/devtools/browser/test-token')
+            popen.assert_not_called()
+            profiles.assert_not_called()
+            http.assert_not_called()
+            self.assertIsNone(session.process)
+            self.assertFalse((folder / '.kantime-cdp.json').exists())
+
+    def test_personal_edge_missing_or_invalid_endpoint_explains_setup_without_fallback(self):
+        for content in (None, '', '0\n/devtools/browser/token',
+                        '65536\n/devtools/browser/token', '43123\n//remote-host/path'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                if content is not None:
+                    (folder / 'DevToolsActivePort').write_text(content)
+                session = self.personal_session(folder)
+                with patch('kantime_engine.browser.subprocess.Popen') as popen:
+                    with self.assertRaisesRegex(BrowserSessionError, 'edge://inspect'):
+                        session.open_window()
+                popen.assert_not_called()
+
+    def test_personal_edge_selects_portal_or_new_tab_and_never_a_work_tab(self):
+        session = self.personal_session(Path('unused'))
+        work = Mock(url='https://rippling.invalid/')
+        work.is_closed.return_value = False
+        fresh = Mock(url='about:blank')
+        fresh.is_closed.return_value = False
+        session.context = Mock(pages=[work])
+        session.context.new_page.return_value = fresh
+        self.assertIs(session.select_page(session.matches_page), fresh)
+        work.goto.assert_not_called()
+        session.context.pages = [work, fresh]
+        self.assertIs(session.select_page(session.matches_page), fresh)
+        self.assertEqual(session.context.new_page.call_count, 1)
+
+    def test_personal_edge_open_reuses_matching_portal_without_navigating(self):
+        session = self.personal_session(Path('unused'))
+        page = Mock(url=SPEC.browser.start_url)
+        with patch.object(session, 'launch'), patch.object(session, 'attach', return_value=page), \
+                patch.object(session.actions, 'goto') as goto:
+            self.assertFalse(session.open_window())
+        goto.assert_not_called()
+        page.bring_to_front.assert_called_once()
+
+    def test_personal_edge_close_disconnects_without_closing_browser(self):
+        session = self.personal_session(Path('unused'))
+        browser, playwright = Mock(), Mock()
+        session.browser, session.playwright = browser, playwright
+        with patch.object(session, '_terminate_process') as terminate, \
+                patch.object(session, '_remove_marker') as remove_marker:
+            session.close()
+        browser.close.assert_not_called()
+        playwright.stop.assert_called_once()
+        terminate.assert_not_called()
+        remove_marker.assert_not_called()
+        self.assertIsNone(session.endpoint)
+
+    def test_local_cdp_works_when_ssl_configuration_is_unavailable(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"Browser": "Edg/test"}')
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with patch("ssl.create_default_context", side_effect=FileNotFoundError("SSL config missing")):
+                self.assertEqual(_cdp_version(f"http://127.0.0.1:{server.server_port}"), {"Browser": "Edg/test"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
     def test_select_page_prefers_the_recently_opened_login_tab(self):
         session = BrowserSession(SPEC.browser, CancellationToken(), ApplicationPaths("test", "test"))
         older = Mock(url="https://example.invalid/old-login")
@@ -34,7 +157,7 @@ class BrowserTests(unittest.TestCase):
             popen.assert_not_called()
             attach.assert_not_called()
 
-    def test_open_window_shows_reused_profile_without_changing_browser_ownership(self):
+    def test_open_window_opens_tab_in_reused_profile_without_changing_browser_ownership(self):
         owner = Mock()
         launcher = Mock()
         with tempfile.TemporaryDirectory() as temp:
@@ -51,7 +174,7 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual(popen.call_count, 2)
             args = popen.call_args.args[0]
             self.assertIn(f"--user-data-dir={Path(temp)}", args)
-            self.assertIn("--new-window", args)
+            self.assertNotIn("--new-window", args)
             self.assertEqual(args[-1], SPEC.browser.start_url)
             self.assertFalse(any(arg.startswith("--remote-debugging-port=") for arg in args))
             self.assertIs(session.process, owner)

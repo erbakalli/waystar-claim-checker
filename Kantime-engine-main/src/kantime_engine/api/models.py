@@ -57,6 +57,7 @@ class ColumnSpec:
     provision: bool = False
     anchor: bool = False
     format: ColumnFormat = ColumnFormat.GENERAL
+    exact_match: bool = False
 
     @property
     def accepted_headers(self) -> tuple[str, ...]:
@@ -67,6 +68,9 @@ class ColumnSpec:
 class SheetRule:
     exact_name: str | None = None
     first_sheet: bool = False
+    name_aliases: tuple[str, ...] = ()
+    exclude_tokens: tuple[str, ...] = ()
+    confirm_match: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ class ResultSheetSpec:
     cell_borders: bool = False
     pending_claim_statuses: tuple[str, ...] = ()
     empty_result_factory: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]] | None = None
+    source_fallback_columns: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,8 @@ class WorkbookSpec:
     compact_summary: bool = False
     save_copy_if_locked: bool = False
     processing_revision: str = ""
+    resume_result_factory: Callable[[Mapping[str, Any]], RowResult | None] | None = None
+    preserve_source_workbook: bool = False
 
     def column(self, key: str) -> ColumnSpec:
         for column in self.columns:
@@ -130,6 +137,7 @@ class VariantSpec:
     agency: str
     payer: str
     sheet: SheetRule
+    browser: BrowserSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,9 @@ class BrowserSpec:
     extension_ids: tuple[str, ...] = ()
     legacy_profile_dir: str | None = None
     login_instructions: str = "Sign in to the portal, then click Start Automation."
+    existing_edge_user_data_dir: str | None = None
+    ready_selector: str | None = None
+    login_url_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -193,13 +204,18 @@ class BrandingSpec:
     export_button_label: str = "Export Results"
     stop_button_label: str = "Stop"
     output_folder_button_label: str = "Open Output Folder"
+    output_file_button_label: str = "Open Output File"
     current_log_button_label: str = "Open Current Log"
     show_open_browser: bool = True
     show_start: bool = True
     show_export: bool = True
     show_stop: bool = True
     show_output_folder: bool = True
+    show_output_file: bool = False
     show_current_log: bool = True
+    show_header: bool = True
+    show_agency: bool = True
+    show_payer: bool = True
 
 
 @dataclass(frozen=True)
@@ -295,6 +311,9 @@ class PortalAutomationBase:
     """Convenience base class with safe no-op lifecycle hooks."""
 
     spec: AutomationSpec
+
+    def browser_spec_for_inputs(self, inputs: Mapping[str, Any], variant: VariantSpec) -> BrowserSpec:
+        return variant.browser or self.spec.browser
 
     def validate_application_inputs(
         self, inputs: Mapping[str, Any], variant: VariantSpec

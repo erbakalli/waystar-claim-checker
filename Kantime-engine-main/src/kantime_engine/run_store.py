@@ -577,6 +577,7 @@ class RunStore:
         expected_legacy_hash: str | None = None,
         result_values: Mapping[str, Any],
         comment: Any,
+        disposition: RowDisposition = RowDisposition.RESOLVED,
     ) -> bool:
         row = self.connection.execute(
             "SELECT input_blob FROM rows WHERE run_id=? AND ordinal=?",
@@ -595,10 +596,12 @@ class RunStore:
         payload = {"values": dict(result_values), "comment": comment}
         self.connection.execute(
             """
-            UPDATE rows SET status='RESOLVED', disposition='resolved',
+            UPDATE rows SET status=?, disposition=?,
                 result_blob=?, updated_at=? WHERE run_id=? AND ordinal=?
             """,
-            (protect(payload), _now(), run_id, int(ordinal)),
+            ({RowDisposition.RESOLVED: 'RESOLVED', RowDisposition.SKIPPED: 'SKIPPED',
+              RowDisposition.RETRY_LATER: 'RETRY_LATER'}[disposition], disposition.value,
+             protect(payload), _now(), run_id, int(ordinal)),
         )
         self.connection.commit()
         return True

@@ -20,7 +20,8 @@ def service_date(value):
         return value
     if value is None or str(value).strip() == "":
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m/%d/%Y %I:%M %p"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y",
+                "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M %p"):
         try:
             return datetime.strptime(str(value).strip(), fmt).date()
         except ValueError:
@@ -32,8 +33,12 @@ def money(value):
     if value is None or str(value).strip() in ("", "-", "N/A"):
         return None
     text = str(value).strip().replace("$", "").replace(",", "")
+    text = text.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
+    text = re.sub(r"\s+", "", text)
     if text.startswith("(") and text.endswith(")"):
         text = "-" + text[1:-1]
+    elif text.endswith("-"):
+        text = "-" + text[:-1]
     try:
         amount = Decimal(text)
         if not amount.is_finite():
@@ -101,7 +106,7 @@ HEADER_ALIASES = {
     "to_date": ("Stmt End", "To Date", "Statement Period End Date"),
     "billed": ("Billed Amount", "Total Charges"),
     "paid": ("Provider Reimb", "Provider Reimbursement", "Paid Amount", "Payment Amount"),
-    "received_date": ("Received Date", "Recieved Date"),
+    "received_date": ("Received Date", "Recieved Date", "Original Rec Date", "Original Received Date"),
     "status": ("Claim Status", "Status"),
     "check_number": ("Check Number", "Check No"),
     "check_date": ("Check Date", "Payment Date"),

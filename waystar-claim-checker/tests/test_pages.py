@@ -13,10 +13,95 @@ for folder in (ROOT / "src", ROOT.parent / "Kantime-engine-main" / "src"):
 
 from kantime_engine import PortalAutomationError, RecoveryAction, RetryScope
 from kantime_engine.cancellation import CancellationRequested
-from waystar_claim_checker.pages import ClaimsPage, CLAIMS_URL, _SearchRequests
+from waystar_claim_checker.pages import ClaimsPage, CLAIMS_URL, HH_CLAIMS_URL, _SearchRequests
+from waystar_claim_checker.application import create_application
 
 
 class PortalTests(unittest.TestCase):
+    def test_document_confirmation_requires_successful_current_frame(self):
+        for case in ('current', 'loading', 'other_frame', 'other_url', 'http_error', 'xhr'):
+            with self.subTest(case=case):
+                top = Mock()
+                surface = Mock(url='https://analytics.ecorpnet.com/member/results.aspx')
+                surface.evaluate.return_value = 'loading' if case == 'loading' else 'interactive'
+                request = Mock(frame=Mock() if case == 'other_frame' else surface,
+                               redirected_to=None,
+                               resource_type='xhr' if case == 'xhr' else 'document',
+                               url=surface.url + '?other' if case == 'other_url' else surface.url)
+                request.response.return_value.status = 500 if case == 'http_error' else 200
+                requests = _SearchRequests(top, surface)
+                requests.started(request)
+                # An unrelated frame is not observed at all.
+                requests.confirm_document(surface)
+                self.assertEqual(requests.completed, case in ('current', 'loading'))
+                if case not in ('current', 'loading', 'other_frame'):
+                    self.assertIn(request, requests.pending)
+
+    def test_background_requests_do_not_block_or_fail_the_pcn_search(self):
+        surface = Mock(url='https://analytics.ecorpnet.com/member/SelectSummary.aspx')
+        top = Mock()
+        search = Mock(frame=surface, resource_type='xhr', url=surface.url)
+        search.response.return_value.status = 200
+        background = Mock(frame=surface, resource_type='fetch',
+                          url='https://analytics.ecorpnet.com/member/SessionKeepAlive.aspx')
+        with _SearchRequests(top, surface, search_only=True) as requests:
+            requests.started(background)
+            self.assertFalse(requests.observed)
+            requests.started(search)
+            self.assertEqual(requests.pending, {search})
+            self.assertFalse(requests.completed)
+            requests.request_failed(background)
+            self.assertFalse(requests.failed)
+            requests.finished(search)
+            self.assertTrue(requests.completed)
+            self.assertEqual(requests.ignored, 1)
+
+    def test_html_and_click_instructions_are_not_reason_descriptions(self):
+        for text in ('<a title="Click for description.">37186</a>',
+                     '&lt;a&gt;37186&lt;/a&gt;', 'Click for description.', 'Hover for description.', 'U5235', '37186'):
+            self.assertFalse(ClaimsPage.is_reason_description(text))
+        self.assertTrue(ClaimsPage.is_reason_description('HH CLAIM HAS BEEN APPROVED FOR PAYMENT.'))
+
+    def test_preparation_does_not_require_an_account_heading(self):
+        for variant in create_application().automation.spec.variants:
+            with self.subTest(variant=variant.id):
+                automation = create_application().automation
+                context = SimpleNamespace(variant=variant, logger=Mock())
+                with patch("waystar_claim_checker.application.load_profile", return_value={}), \
+                        patch("waystar_claim_checker.application.ClaimsPage") as page:
+                    page.return_value.read_office.side_effect = AssertionError("Account heading is unavailable")
+                    automation.prepare_portal(context)
+                    page.return_value.open.assert_called_once_with()
+                    page.return_value.read_office.assert_not_called()
+                expected = ""
+                self.assertEqual(automation.office, expected)
+
+    def test_hh_uses_analytics_frame_and_keeps_md_account_name(self):
+        adapter, locators, outer, frame = self.embedded_adapter()
+        adapter.context.variant = create_application().resolve("Any agency", "HH - Medicare")
+        frame.url = "https://analytics.ecorpnet.com/member/SelectSummary.aspx"
+        adapter = ClaimsPage(adapter.context, adapter.profile)
+        self.assertIs(adapter.page, frame)
+        self.assertFalse(adapter.signed_out())
+        adapter.open()
+        adapter.context.actions.goto.assert_called_once_with(outer, HH_CLAIMS_URL, timeout_ms=60_000)
+        locators["body"] = Mock()
+        locators["body"].inner_text.return_value = "Account MD Home Health (12345)"
+        adapter.context.actions.wait_for_any.side_effect = lambda outcomes, **kwargs: (
+            "account" if outcomes["account"]() else "login")
+        self.assertEqual(adapter.read_office(), "MD Home Health")
+
+    def test_ngs_page_does_not_count_as_ready_for_hh(self):
+        adapter, locators = self.adapter()
+        adapter.context.variant = create_application().resolve("Any agency", "HH - Medicare")
+        adapter = ClaimsPage(adapter.context, adapter.profile)
+        locators["#search"].is_visible.return_value = True
+        self.assertTrue(adapter.signed_out())
+        with patch.object(adapter, "select_pcn"):
+            adapter.open()
+        adapter.context.actions.goto.assert_called_once_with(
+            adapter.context.page, HH_CLAIMS_URL, timeout_ms=60_000)
+
     def test_open_reuses_signed_in_claims_page_for_another_workbook(self):
         adapter, locators = self.adapter()
         locators["#search"].is_visible.return_value = True
@@ -39,20 +124,41 @@ class PortalTests(unittest.TestCase):
             adapter.context.page, CLAIMS_URL, timeout_ms=60_000)
 
     def test_office_is_read_from_account_heading_without_account_number(self):
+        for office in ("Arizona Home Care", "MD Home Health", "Other Home Care"):
+            with self.subTest(office=office):
+                adapter, locators = self.adapter()
+                body = Mock()
+                locators["body"] = body
+                body.inner_text.return_value = f"Waystar\nAccount\n{office} (000123)\nWelcome, User"
+                adapter.context.actions.wait_for_any.side_effect = lambda outcomes, **kwargs: (
+                    "account" if outcomes["account"]() else "login")
+                self.assertEqual(adapter.read_office(), office)
+
+    def test_office_heading_can_wrap_across_lines(self):
         adapter, locators = self.adapter()
-        body = Mock()
-        locators["body"] = body
-        body.inner_text.return_value = "Waystar\nAccount\nOther Home Care (000123)\nWelcome, User"
-        adapter.context.actions.wait_for_any.side_effect = lambda outcomes: (
+        locators["body"] = Mock()
+        locators["body"].inner_text.return_value = "Account\nOther\nHome Care\n(000123)"
+        adapter.context.actions.wait_for_any.side_effect = lambda outcomes, **kwargs: (
+            "account" if outcomes["account"]() else "login")
+        self.assertEqual(adapter.read_office(), "Other Home Care")
+        locators["body"].inner_text.assert_called_once_with(timeout=500)
+
+    def test_office_in_outer_header_survives_unreadable_claims_frame(self):
+        adapter, locators, outer, frame = self.embedded_adapter()
+        locators["body"] = Mock()
+        locators["body"].inner_text.side_effect = TimeoutError("Frame is loading")
+        outer.locator.return_value.inner_text.return_value = "Account Other Home Care (000123)"
+        adapter.context.actions.wait_for_any.side_effect = lambda outcomes, **kwargs: (
             "account" if outcomes["account"]() else "login")
         self.assertEqual(adapter.read_office(), "Other Home Care")
 
-    def test_missing_account_stops_without_assuming_an_office(self):
+    def test_missing_account_does_not_stop_automation(self):
         adapter, locators = self.adapter()
         adapter.context.actions.wait_for_any.side_effect = TimeoutError("No Account heading")
-        with self.assertRaises(PortalAutomationError) as caught:
-            adapter.read_office()
-        self.assertEqual(caught.exception.reason, "office_not_found")
+        adapter.context.variant = create_application().resolve("Any agency", "HH - Medicare")
+        self.assertEqual(adapter.read_office(), "")
+        adapter.context.variant = create_application().resolve("Any agency", "NGS")
+        self.assertEqual(adapter.read_office(), "")
 
     def split_header_table(self):
         adapter, _ = self.adapter()
@@ -75,6 +181,7 @@ class PortalTests(unittest.TestCase):
             cells[19] = "000000" + str(number)
             cells[20] = "CROSS-REFERENCE-" + str(number)
             reason = Mock()
+            reason.locator.return_value.count.return_value = 0
             reason.get_attribute.return_value = "Synthetic description " + str(number)
             cell_locator = Mock()
             cell_locator.all_text_contents.return_value = cells
@@ -280,6 +387,7 @@ class PortalTests(unittest.TestCase):
         adapter, locators = self.adapter()
         cell = Mock()
         cell.get_attribute.return_value = "Example rejection description"
+        cell.locator.return_value.count.return_value = 0
         self.assertEqual(adapter.read_primary_reason(cell, "12345"), "Example rejection description")
         cell.hover.assert_not_called()
 
@@ -303,6 +411,8 @@ class PortalTests(unittest.TestCase):
         cell = Mock()
         cell.get_attribute.return_value = None
         cell.locator.return_value.count.return_value = 0
+        locators['[role="tooltip"]:visible, .RadToolTip:visible'] = Mock()
+        adapter.context.actions.wait_visible.side_effect = ValueError("No reason tooltip")
         with self.assertRaises(ValueError):
             adapter.read_primary_reason(cell, "12345")
 

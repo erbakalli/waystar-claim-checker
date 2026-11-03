@@ -92,6 +92,7 @@ class UiContractTests(unittest.TestCase):
     def test_changing_workbook_preserves_signed_in_browser(self):
         controller = self._login_controller()
         browser = Mock()
+        browser.spec = SPEC.browser
         old = SimpleNamespace(browser=browser, workbook=Mock(), logger=Mock())
         controller._session = old
         controller._validated = Mock(return_value=(SPEC.variants[0], {"workbook": "new.xlsx"}))
@@ -142,7 +143,8 @@ class UiContractTests(unittest.TestCase):
     def test_next_batch_reuses_the_same_prepared_workbook(self):
         controller = self._login_controller()
         validated = {"workbook": "input.xlsx"}
-        controller._session = SimpleNamespace(variant=SPEC.variants[0], inputs=validated)
+        controller._session = SimpleNamespace(variant=SPEC.variants[0], inputs=validated,
+                                              browser=SimpleNamespace(spec=SPEC.browser))
         controller._validated = Mock(return_value=(SPEC.variants[0], validated))
         controller._prepare = Mock()
         controller._start = Mock()

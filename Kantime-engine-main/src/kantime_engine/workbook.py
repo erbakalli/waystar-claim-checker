@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 import uuid
 
 from .api import RowDisposition, RowRecord, RowResult, VariantSpec, WorkbookSpec
-from .api import OutputPolicy
+from .api import OutputPolicy, SheetRule
 from .output import OutputLayout
 from .paths import ApplicationPaths
 from .reporting import ReportError, generate_report
@@ -95,6 +95,7 @@ class WorkbookSession:
         self,
         path: str,
         resume_decider: ResumeDecider | None = None,
+        *, sheet_decider: Callable[[tuple[str, ...]], str | None] | None = None,
     ) -> WorkbookPreparation:
         source = Path(path).expanduser().resolve()
         if not source.is_file():
@@ -105,7 +106,7 @@ class WorkbookSession:
             staging = self.app_paths.runs / f".snapshot-{uuid.uuid4().hex}{extension}"
             try:
                 source_hash = copy_with_hash(source, staging)
-                layout = inspect_source(staging, self.variant)
+                layout = inspect_source(staging, self.variant, sheet_decider)
                 column_map = map_columns(layout.headers, self.spec)
                 self._validate_columns(column_map)
                 current_schema_hash = schema_hash(self.spec, layout.headers)
@@ -160,7 +161,7 @@ class WorkbookSession:
                 )
                 try:
                     self._ingest(run, layout, column_map)
-                    imported = self._import_legacy(run)
+                    imported = self._import_legacy(run) if existing is None else 0
                     self.store.mark_prepared(run.id)
                 except Exception:
                     self.store.abandon(run.id)
@@ -190,14 +191,14 @@ class WorkbookSession:
         ) as exc:
             raise WorkbookError(str(exc)) from exc
 
-    def load_saved(self, path: str) -> WorkbookPreparation:
+    def load_saved(self, path: str, *, sheet_decider: Callable[[tuple[str, ...]], str | None] | None = None) -> WorkbookPreparation:
         source = Path(path).expanduser().resolve()
         if not source.is_file():
             raise WorkbookError(f"Collection file not found: {source}")
         try:
             validate_extension(source)
             source_hash = file_hash(source)
-            layout = inspect_source(source, self.variant)
+            layout = inspect_source(source, self.variant, sheet_decider)
             column_map = map_columns(layout.headers, self.spec)
             self._validate_columns(column_map)
             current_schema_hash = schema_hash(self.spec, layout.headers)
@@ -295,9 +296,24 @@ class WorkbookSession:
         self.store.set_statistics(run.id, statistics)
 
     def _import_legacy(self, run: RunInfo) -> int:
-        # Product-specific legacy migration belongs to the consumer application.
-        del run
-        return 0
+        factory = self.spec.resume_result_factory
+        if factory is None:
+            return 0
+        run = self.store.get_run(run.id)
+        layout = inspect_source(Path(run.snapshot_path),
+                                replace(self.variant, sheet=SheetRule(exact_name=run.sheet_name)))
+        imported = 0
+        for ordinal, (_source_row, cells) in enumerate(iter_source_rows(run.snapshot_path, layout)):
+            if ordinal >= run.row_count:
+                break
+            result = factory(dict(zip(layout.headers, cells)))
+            if result is not None:
+                self.store.import_completed(
+                    run.id, ordinal, result_values=result.values, comment=result.comment,
+                    disposition=result.disposition,
+                )
+                imported += 1
+        return imported
 
     @property
     def row_count(self) -> int:

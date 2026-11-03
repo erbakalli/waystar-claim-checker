@@ -20,6 +20,7 @@ from .power import KeepAwake
 from .preflight import check_preflight
 from .run_store import RunStore
 from .runner import AutomationRunner
+from .spreadsheet_source import _select_sheet, SpreadsheetSourceError
 from .state import LifecycleState, RunSession
 from .validation import validate_inputs
 from .workbook import WorkbookSession
@@ -39,6 +40,7 @@ class EngineController:
         self._browser_first = False
         self._last_log_path: Path | None = None
         self._last_output_dir: Path | None = None
+        self._last_output_file: Path | None = None
         self._tasks: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._startup_done = False
         self._thread = threading.Thread(
@@ -67,6 +69,18 @@ class EngineController:
     @property
     def current_output_dir(self) -> Path | None:
         return self._session.output_layout.root if self._session is not None else self._last_output_dir
+
+    @property
+    def current_output_file(self) -> Path | None:
+        path = self._last_output_file
+        return path if path is not None and path.is_file() else None
+
+    def _remember_output(self, output: Path) -> None:
+        self._last_output_file = output
+        self._last_output_dir = output.parent
+        callback = getattr(self.ui, "refresh_output_buttons", None)
+        if callable(callback):
+            callback()
 
     def _set_state(self, state: LifecycleState) -> None:
         with self._state_lock:
@@ -219,6 +233,10 @@ class EngineController:
         )
         self._last_log_path = logger.path
         self._last_output_dir = layout.root
+        self._last_output_file = None
+        callback = getattr(self.ui, "refresh_output_buttons", None)
+        if callable(callback):
+            callback()
         return logger
 
     def _validated(self, inputs: Mapping[str, Any]) -> tuple[Any, dict[str, Any]]:
@@ -234,35 +252,69 @@ class EngineController:
         return variant, validated
 
     def _open_browser(self, inputs: Mapping[str, Any]) -> None:
-        self.application.resolve(str(inputs.get("agency", "")), str(inputs.get("payer", "")))
+        variant = self.application.resolve(str(inputs.get("agency", "")), str(inputs.get("payer", "")))
+        browser_spec = self.automation.browser_spec_for_inputs(inputs, variant)
         self._browser_first = True
         browser = self._session.browser if self._session is not None else self._login_browser
+        if browser is not None and browser.spec.existing_edge_user_data_dir != browser_spec.existing_edge_user_data_dir:
+            browser.detach()
+            browser = None
         if browser is None:
             browser = BrowserSession(
-                self.automation.spec.browser, self.cancellation, self.paths,
+                browser_spec, self.cancellation, self.paths,
                 default_timeout_ms=self.automation.spec.run_policy.default_step_timeout_ms,
             )
             self._login_browser = browser
-        # Human sign-in takes place without an attached Playwright debugger.
-        browser.detach()
+            if self._session is not None:
+                self._session.browser = browser
+        # Keep an existing personal-Edge connection so repeated clicks do not
+        # restart CDP discovery and ask Edge for permission again.
+        if not browser_spec.existing_edge_user_data_dir:
+            browser.detach()
+        browser.spec = browser_spec
+        browser.status_callback = lambda message: self._user(message, event="browser.opening")
         if self._session is not None:
             self._session.context = None
-        self._user("Opening Microsoft Edge for Waystar sign-in...", event="browser.login_opening")
+        message = ("Connecting to your open Microsoft Edge. Allow the connection in Edge if asked..."
+                   if browser_spec.existing_edge_user_data_dir else
+                   "Opening Microsoft Edge for Waystar sign-in...")
+        self._user(message, event="browser.login_opening")
         browser.open_window()
         self.cancellation.raise_if_cancelled()
-        self._user(self.automation.spec.browser.login_instructions, event="browser.login_instructions")
+        self._user(browser_spec.login_instructions, event="browser.login_instructions")
         self._set_state(LifecycleState.READY)
 
     def _start_from_browser(self, inputs: Mapping[str, Any]) -> None:
         variant, validated = self._validated(inputs)
         session = self._session
         if (session is None or variant != session.variant or
+                self.automation.browser_spec_for_inputs(validated, variant) != session.browser.spec or
                 str(validated.get(self.automation.spec.source_field, "")) !=
                 str(session.inputs.get(self.automation.spec.source_field, ""))):
             self._set_state(LifecycleState.PREPARING)
             self._prepare(validated, preserve_browser=True)
             self._set_state(LifecycleState.RUNNING)
         self._start(validated)
+
+    def _choose_sheet(self, payer: str, names: tuple[str, ...], *, variant: Any = None) -> str:
+        if variant is not None and variant.sheet.confirm_match:
+            try:
+                matched = _select_sheet(list(names), variant)
+            except SpreadsheetSourceError:
+                matched = None
+            agency_detail = (f"Agency: {variant.agency}\n"
+                             if self.application.spec.branding.show_agency else "")
+            payer_detail = (f"Payer: {payer}\n"
+                            if self.application.spec.branding.show_payer else "")
+            if matched is not None and self.ui.ask_yes_no(
+                "Confirm worksheet",
+                f"{agency_detail}{payer_detail}Sheet: {matched}\n\nContinue with this worksheet?",
+            ):
+                return matched
+        selected = self.ui.ask_sheet(payer, names)
+        if selected is None:
+            raise CancellationRequested("Worksheet selection cancelled")
+        return selected
 
     def _prepare(self, inputs: Mapping[str, Any], *, preserve_browser: bool = False) -> None:
         variant = self.application.resolve(str(inputs.get("agency", "")), str(inputs.get("payer", "")))
@@ -305,7 +357,10 @@ class EngineController:
                     "\nNo — start a new run and retain the previous run as abandoned.",
                 )
 
-            prepared = workbook.prepare(source, choose_resume)
+            def choose_sheet(names: tuple[str, ...]) -> str:
+                return self._choose_sheet(variant.payer, names, variant=variant)
+
+            prepared = workbook.prepare(source, choose_resume, sheet_decider=choose_sheet)
             if workbook.run is not None:
                 logger.bind_run(workbook.run.id)
             logger.info(
@@ -318,22 +373,31 @@ class EngineController:
                 f"Prepared {workbook.row_count} rows from {prepared.sheet_name}. The selected source file was not changed.",
                 "success", event="workbook.ready",
             )
+            browser_spec = self.automation.browser_spec_for_inputs(validated, variant)
+            if (retained_browser is not None and
+                    retained_browser.spec.existing_edge_user_data_dir != browser_spec.existing_edge_user_data_dir):
+                retained_browser.detach()
+                retained_browser = None
             browser = retained_browser or BrowserSession(
-                self.automation.spec.browser,
+                browser_spec,
                 self.cancellation,
                 self.paths,
                 logger,
                 self.automation.spec.run_policy.default_step_timeout_ms,
             )
+            browser.spec = browser_spec
             browser.logger = logger
             browser.actions.logger = logger
-            logger.user("Opening a dedicated Microsoft Edge window...", event="browser.launching")
+            message = ("Connecting to your open Microsoft Edge..."
+                       if browser_spec.existing_edge_user_data_dir else
+                       "Opening a dedicated Microsoft Edge window...")
+            logger.user(message, event="browser.launching")
             launched = browser.launch()
             self.cancellation.raise_if_cancelled()
             self._session = RunSession(variant, validated, workbook, browser, logger, layout)
             self._login_browser = None
             logger.info("browser.ready", "Managed Edge is ready", launched=launched)
-            logger.user(self.automation.spec.browser.login_instructions, event="browser.login_instructions")
+            logger.user(browser_spec.login_instructions, event="browser.login_instructions")
             self._set_state(LifecycleState.READY)
         except Exception as exc:
             try:
@@ -381,7 +445,9 @@ class EngineController:
         if session is None:
             raise RuntimeError("No prepared automation session exists")
         variant, validated = self._validated(inputs)
-        if variant != session.variant or str(validated.get(self.automation.spec.source_field, "")) != str(session.inputs.get(self.automation.spec.source_field, "")):
+        if (variant != session.variant or
+                self.automation.browser_spec_for_inputs(validated, variant) != session.browser.spec or
+                str(validated.get(self.automation.spec.source_field, "")) != str(session.inputs.get(self.automation.spec.source_field, ""))):
             raise RuntimeError("The selected variant or workbook changed. Prepare again before starting.")
         status = "error"
         runner: AutomationRunner | None = None
@@ -432,6 +498,7 @@ class EngineController:
         try:
             self.automation.before_export(session.context)
             output = session.workbook.export_report()
+            self._remember_output(output)
             self.automation.after_export(output, session.context)
             session.logger.user(
                 f"Results report saved after {reason}: {output}",
@@ -473,13 +540,14 @@ class EngineController:
         export_status = "export_complete"
         try:
             logger.user("Finding saved progress for the selected input...", event="export.loading")
-            workbook.load_saved(source)
+            workbook.load_saved(source, sheet_decider=lambda names: self._choose_sheet(variant.payer, names, variant=variant))
             if workbook.run is not None:
                 logger.bind_run(workbook.run.id)
             self.ui.set_statistics(workbook.statistics())
             context = self._session.context if self._session is not None else None
             self.automation.before_export(context)
             output = workbook.export_report()
+            self._remember_output(output)
             self.automation.after_export(output, context)
             logger.user("Results report exported.", "success", event="export.completed", report_path=str(output))
             self._set_export_recovery(False)

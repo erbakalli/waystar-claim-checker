@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
@@ -96,7 +96,8 @@ class EngineWindow:
         outer.grid_rowconfigure(6, weight=1)
 
         header = tk.Frame(outer, bg=self.BG)
-        header.grid(row=0, column=0, sticky="ew")
+        if self.application.spec.branding.show_header:
+            header.grid(row=0, column=0, sticky="ew")
         if self.application.spec.branding.logo:
             try:
                 with Image.open(self._asset_path(self.application.spec.branding.logo)) as source:
@@ -128,7 +129,8 @@ class EngineWindow:
         form.grid_columnconfigure(1, weight=1)
         self.form = form
 
-        self._form_label(form, "Agency", 0)
+        if self.application.spec.branding.show_agency:
+            self._form_label(form, "Agency", 0)
         self.agency_combo = ttk.Combobox(
             form,
             textvariable=self.agency_var,
@@ -136,10 +138,12 @@ class EngineWindow:
             style="Engine.TCombobox",
             font=("Segoe UI", 10),
         )
-        self.agency_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        if self.application.spec.branding.show_agency:
+            self.agency_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
         self.agency_combo.bind("<<ComboboxSelected>>", self._agency_changed)
 
-        self._form_label(form, "Payer / Automation", 1)
+        if self.application.spec.branding.show_payer:
+            self._form_label(form, "Payer / Automation", 1)
         self.payer_combo = ttk.Combobox(
             form,
             textvariable=self.payer_var,
@@ -147,7 +151,8 @@ class EngineWindow:
             style="Engine.TCombobox",
             font=("Segoe UI", 10),
         )
-        self.payer_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
+        if self.application.spec.branding.show_payer:
+            self.payer_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
         self.payer_combo.bind("<<ComboboxSelected>>", self._payer_changed)
 
         self.dynamic_form = tk.Frame(form, bg=self.BG)
@@ -191,11 +196,19 @@ class EngineWindow:
 
         file_buttons = tk.Frame(controls, bg=self.BG)
         file_buttons.pack(pady=(0, 8))
+        self.output_file_button = self._button(
+            file_buttons,
+            self.application.spec.branding.output_file_button_label,
+            self._open_output_file,
+            "#0F766E",
+        )
+        if self.application.spec.branding.show_output_file:
+            self.output_file_button.pack(side=tk.LEFT, padx=6)
         self.output_button = self._button(
             file_buttons,
             self.application.spec.branding.output_folder_button_label,
             self._open_output,
-            "#64748B",
+            "#38BDF8",
         )
         if self.application.spec.branding.show_output_folder:
             self.output_button.pack(side=tk.LEFT, padx=6)
@@ -263,6 +276,11 @@ class EngineWindow:
             padx=12,
             pady=8,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._build_activity_display(lower)
+        self._build_extensions(extension_context)
+        self.set_state(LifecycleState.IDLE.value)
+
+    def _build_activity_display(self, lower: tk.Frame) -> None:
         tk.Label(
             lower,
             text="Activity Log",
@@ -291,8 +309,6 @@ class EngineWindow:
         self.log_text.tag_config("info", foreground="#2563EB")
         self.log_text.tag_config("success", foreground=self.SUCCESS)
         self.log_text.tag_config("error", foreground=self.ERROR)
-        self._build_extensions(extension_context)
-        self.set_state(LifecycleState.IDLE.value)
 
     def _build_extensions(self, context: Any) -> None:
         notebook: ttk.Notebook | None = None
@@ -340,6 +356,7 @@ class EngineWindow:
             font=("Segoe UI", 10, "bold"),
             bg=color,
             fg="white",
+            disabledforeground="white",
             activebackground=color,
             activeforeground="white",
             relief="flat",
@@ -539,6 +556,19 @@ class EngineWindow:
     def _open_output(self) -> None:
         self._open_path(self.controller.current_output_dir, "No output folder is available yet.")
 
+    def _open_output_file(self) -> None:
+        self._open_path(self.controller.current_output_file, "No output file is available yet.")
+
+    def refresh_output_buttons(self) -> None:
+        def apply() -> None:
+            self.output_file_button.configure(
+                state="normal" if self.controller.current_output_file else "disabled"
+            )
+            self.output_button.configure(
+                state="normal" if self.controller.current_output_dir else "disabled"
+            )
+        self._schedule(apply)
+
     def _open_log(self) -> None:
         self._open_path(self.controller.current_log_path, "No execution log is available yet.")
 
@@ -547,7 +577,10 @@ class EngineWindow:
             self.show_error("Not available", missing)
             return
         if hasattr(os, "startfile"):
-            os.startfile(str(path))
+            try:
+                os.startfile(str(path))
+            except OSError as exc:
+                self.show_error("Could not open", str(exc))
 
     def _on_close(self) -> None:
         self.controller.shutdown()
@@ -585,6 +618,7 @@ class EngineWindow:
             )
             self.stop_button.configure(state="normal" if busy else "disabled")
             self.output_button.configure(state="normal" if self.controller.current_output_dir else "disabled")
+            self.output_file_button.configure(state="normal" if self.controller.current_output_file else "disabled")
             self.log_button.configure(state="normal" if self.controller.current_log_path else "disabled")
             for button, action in self._extension_buttons:
                 button.configure(state="normal" if state in action.allowed_states else "disabled")
@@ -648,6 +682,30 @@ class EngineWindow:
         return self._blocking_prompt(
             lambda: messagebox.askyesno(title, message, parent=self.root)
         )
+
+    def ask_sheet(self, payer: str, names: tuple[str, ...]) -> str | None:
+        result = {"sheet": None}
+
+        class SheetDialog(simpledialog.Dialog):
+            def body(dialog, master):
+                prompt = (f"Payer: {payer}\n" if self.application.spec.branding.show_payer else "")
+                tk.Label(master, text=prompt + "Select the worksheet to process.").pack(padx=12, pady=10)
+                dialog.choice = ttk.Combobox(master, values=names, state="readonly", width=50)
+                dialog.choice.pack(padx=12, pady=10)
+                return dialog.choice
+
+            def validate(dialog):
+                return dialog.choice.get() in names
+
+            def apply(dialog):
+                result["sheet"] = dialog.choice.get()
+
+        def show():
+            SheetDialog(self.root, title="Select worksheet")
+            return True
+
+        self._blocking_prompt(show)
+        return result["sheet"]
 
     def ask_retry_cancel(self, title: str, message: str) -> bool:
         return self._blocking_prompt(

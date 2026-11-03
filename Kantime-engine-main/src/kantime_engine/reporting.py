@@ -67,6 +67,10 @@ def _value_cell(sheet: Any, value: Any) -> Any:
 def _matching_spec(header: Any, columns: tuple[ColumnSpec, ...]) -> ColumnSpec | None:
     normalized = normalize_header(header)
     for column in columns:
+        if column.exact_match:
+            if header in column.accepted_headers:
+                return column
+            continue
         accepted = {normalize_header(value) for value in column.accepted_headers}
         if normalized in accepted or any(token.lower() in normalized for token in column.contains):
             return column
@@ -114,10 +118,16 @@ def _parse_currency(value: Any) -> Any:
     if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
         return float(value)
     text = str(value).strip()
+    text = text.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
+    text = re.sub(r"\s+", "", text).replace("$", "").replace(",", "")
     negative = text.startswith("(") and text.endswith(")")
-    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    cleaned = text[1:-1] if negative else text
+    if cleaned.endswith("-"):
+        cleaned = "-" + cleaned[:-1]
     try:
         amount = Decimal(cleaned)
+        if not amount.is_finite():
+            return value
     except (InvalidOperation, ValueError):
         return value
     if negative:
@@ -131,7 +141,8 @@ def _parse_date(value: Any) -> Any:
     if isinstance(value, (date, datetime)):
         return value
     text = str(value).strip()
-    for pattern in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+    for pattern in ("%m/%d/%Y", "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%y",
+                    "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(text, pattern).date()
         except ValueError:
@@ -155,11 +166,7 @@ def _style_body_cell(cell: WriteOnlyCell, column: ReportColumn, alternate: bool)
     cell.font = BODY_FONT
     cell.alignment = Alignment(
         vertical="top" if column.spec and column.spec.format == ColumnFormat.LONG_TEXT else "center",
-        horizontal=(
-            "right"
-            if column.spec and column.spec.format == ColumnFormat.CURRENCY
-            else "left"
-        ),
+        horizontal="left",
         wrap_text=bool(column.spec and column.spec.format == ColumnFormat.LONG_TEXT),
     )
     if alternate:
@@ -232,7 +239,7 @@ def _next_persisted(
     return (current if current is not None and current.source_row == source_row else None), current
 
 
-def generate_report(
+def _generate_report(
     *,
     store: RunStore,
     run: RunInfo,
@@ -279,6 +286,7 @@ def generate_report(
     summary.column_dimensions["B"].width = 44
     title = _value_cell(summary, f"{run.automation_name} Results")
     title.font = TITLE_FONT
+    title.alignment = Alignment(horizontal="left")
     summary.append([title])
     summary.append([])
     completed = counts.get("RESOLVED", 0) + counts.get("SKIPPED", 0)
@@ -329,10 +337,10 @@ def generate_report(
         left = _value_cell(summary, label)
         left.font = Font(name="Arial", size=10, bold=True, color="1F2937")
         left.fill = SUMMARY_FILL
-        left.alignment = Alignment(vertical="center")
+        left.alignment = Alignment(horizontal="left", vertical="center")
         right = _value_cell(summary, value)
         right.font = BODY_FONT
-        right.alignment = Alignment(vertical="top" if spec.compact_summary else "center",
+        right.alignment = Alignment(horizontal="left", vertical="top" if spec.compact_summary else "center",
                                     wrap_text=spec.compact_summary)
         if spec.compact_summary:
             lines = max(1, len(textwrap.wrap(str(value), width=35)))
@@ -359,7 +367,7 @@ def generate_report(
         cell = _value_cell(results, column.header)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="left", vertical="center")
         header_cells.append(cell)
     results.append(header_cells)
 
@@ -442,7 +450,7 @@ def generate_report(
             cell.fill = PatternFill("solid", fgColor=sheet_spec.header_color)
             if sheet_spec.cell_borders:
                 cell.border = TABLE_BORDER
-            cell.alignment = Alignment(horizontal="center" if sheet_spec.grouped_columns else "left",
+            cell.alignment = Alignment(horizontal="left",
                                        vertical="center", wrap_text=True)
             detail_headers.append(cell)
         detail.append(detail_headers)
@@ -456,9 +464,17 @@ def generate_report(
                             raise ReportError(f"Result sheet has conflicting values for shared column {key}")
                         shared_values[key] = value
         count = 0
-        source_iterator = iter(iter_source_rows(run.snapshot_path, layout)) if sheet_spec.empty_result_factory else None
+        source_iterator = (iter(iter_source_rows(run.snapshot_path, layout))
+                           if sheet_spec.empty_result_factory or sheet_spec.source_fallback_columns else None)
         source_current = next(source_iterator, None) if source_iterator is not None else None
         for persisted in store.iter_rows(run.id):
+            source_data = {}
+            if source_iterator is not None:
+                while source_current is not None and source_current[0] < persisted.source_row:
+                    source_current = next(source_iterator, None)
+                if source_current is None or source_current[0] != persisted.source_row:
+                    raise ReportError("Saved input row is missing from the source snapshot")
+                source_data = dict(zip(headers, source_current[1]))
             records = persisted.result.get(sheet_spec.result_key, [])
             if not isinstance(records, list):
                 raise ReportError("Result sheet records must be a list")
@@ -466,6 +482,8 @@ def generate_report(
                 raise ReportError("Result sheet rows must be mappings")
             if sheet_spec.grouped_columns:
                 combined = _group_detail_records(records, sheet_spec)
+                if not records:
+                    combined.update(persisted.result.get("resume_output", {}))
                 combined["automation_status"] = {
                     "RESOLVED": "Done", "SKIPPED": "Skipped", "RETRY_LATER": "Retry later",
                 }.get(persisted.status, persisted.status.title())
@@ -474,12 +492,8 @@ def generate_report(
                         in {status.casefold() for status in sheet_spec.pending_claim_statuses}
                         for record in records)):
                     combined["automation_status"] = "Pending"
-                if not records and persisted.status == "RESOLVED" and sheet_spec.empty_result_factory:
-                    while source_current is not None and source_current[0] < persisted.source_row:
-                        source_current = next(source_iterator, None)
-                    if source_current is None or source_current[0] != persisted.source_row:
-                        raise ReportError("Saved input row is missing from the source snapshot")
-                    source_data = dict(zip(headers, source_current[1]))
+                if (not records and sheet_spec.empty_result_factory
+                        and "resume_output" not in persisted.result):
                     fallback = sheet_spec.empty_result_factory(source_data, persisted.result)
                     if not isinstance(fallback, Mapping):
                         raise ReportError("Empty result factory must return a mapping")
@@ -487,15 +501,24 @@ def generate_report(
                 combined.setdefault("pcn", persisted.result.get("pcn"))
                 if persisted.status == "RETRY_LATER":
                     combined["last_error"] = persisted.comment or persisted.result.get("checker_comments")
+                else:
+                    combined["last_error"] = None
                 records = [combined]
             for record in records:
                 if not isinstance(record, dict):
                     raise ReportError("Result sheet rows must be mappings")
+                source_values = {normalize_header(key): value for key, value in source_data.items()}
                 cells = []
                 row_values = []
                 for column in detail_columns:
                     value = (shared_values.get(column.spec.key) if column.spec.key in sheet_spec.shared_columns
                              else record.get(column.spec.key, sheet_spec.missing_values.get(column.spec.key)))
+                    if value is None or (isinstance(value, str) and not value.strip()):
+                        for header in sheet_spec.source_fallback_columns.get(column.spec.key, ()):
+                            candidate = source_values.get(normalize_header(header))
+                            if candidate is not None and (not isinstance(candidate, str) or candidate.strip()):
+                                value = candidate
+                                break
                     if (column.spec.key in sheet_spec.processed_only_columns
                             and persisted.status not in {"RESOLVED", "SKIPPED", "RETRY_LATER"}):
                         value = None
@@ -513,8 +536,7 @@ def generate_report(
                         cell.border = TABLE_BORDER
                     if isinstance(value, str) and "\n" in value:
                         cell.number_format = "@"
-                    cell.alignment = Alignment(vertical="top", wrap_text=True,
-                                               horizontal="right" if column.spec.format == ColumnFormat.CURRENCY else "left")
+                    cell.alignment = Alignment(vertical="top", wrap_text=True, horizontal="left")
                     cells.append(cell)
                 detail.append(cells)
                 count += 1
@@ -571,9 +593,18 @@ def generate_report(
     except OSError as exc:
         raise ReportError(f"Could not save report: {exc}") from exc
     finally:
+        workbook.close()
         try:
             if temp.exists():
                 temp.unlink()
         except OSError:
             pass
     return output
+
+
+def generate_report(*, store, run, spec, statistics):
+    if spec.preserve_source_workbook:
+        from .ct_reporting import generate_preserved_report
+        return generate_preserved_report(store=store, run=run, spec=spec,
+                                         statistics=statistics, detail_writer=_generate_report)
+    return _generate_report(store=store, run=run, spec=spec, statistics=statistics)

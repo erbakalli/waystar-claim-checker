@@ -28,9 +28,9 @@ EXPECTED_CLAIM_HEADERS = (
     "InvoiceNumber", "Invoice Date", "Units", "Amount", "PaidAmount", "Adj.",
     "Balance", "Pay. Status", "Current Reason for Non - Payment", "TRN",
     "Note(s)/ Follow Up", "AltPatientID", "Representative", "DOB", "StartDate",
-    "EndDate", "Claim ID", "Billed Amount", "Paid Amount", "Claim Status",
-    "Denial Reason", "Last Action Taken", "Finalized Date", "Check Number",
-    "Check Date", "Recheck", "AutomationStatus", "LastError",
+    "EndDate", "Claim ID / TRN", "Billed Amount", "Paid amount", "Claim status",
+    "Denial Reason", "Last Action Taken", "Finalized Date", "Payment/Check Number",
+    "Payment/Check Date", "Recheck", "AutomationStatus", "LastError",
 )
 
 
@@ -69,6 +69,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp:
             source = Path(temp) / "legacy.xlsx"
             book = Workbook()
+            book.active.title = 'NGS'
             book.active.append(["Invoice No"])
             book.active.append(["0001"])
             book.active.append(["0002"])
@@ -106,6 +107,7 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(header=header), tempfile.TemporaryDirectory(dir=ROOT) as temp:
                 source = Path(temp) / "invoice-only.xlsx"
                 book = Workbook()
+                book.active.title = 'NGS'
                 book.active.append([header])
                 book.active.append(["000123"])
                 book.save(source)
@@ -129,7 +131,7 @@ class MatchingTests(unittest.TestCase):
                     try:
                         rows = list(report["Claims"].iter_rows(values_only=True))
                         self.assertEqual(rows[1][rows[0].index("InvoiceNumber")], "000123")
-                        self.assertEqual(rows[1][rows[0].index("Claim ID")], "000456")
+                        self.assertEqual(rows[1][rows[0].index("Claim ID / TRN")], "000456")
                         self.assertEqual(rows[1][rows[0].index("Amount")], 100)
                         self.assertIn("Comments", next(report["Results"].iter_rows(values_only=True)))
                     finally:
@@ -270,6 +272,9 @@ class MatchingTests(unittest.TestCase):
                "05/31/26", "$100.00", "12345", "06/10/26", "0000000123AZR",
                "06/01/26", "$75.00", "$90.00"]
         parsed = parse_table(headers, [row], primary_reasons=["Example rejection description."])
+        hh_headers = ["Original Rec Date" if value == "Received Date" else value for value in headers]
+        hh_claim = parse_table(hh_headers, [row], primary_reasons=["Example rejection description."])[0]
+        self.assertEqual(hh_claim.received_date, date(2026, 6, 1))
         self.assertEqual(parsed[0].status, "Rejected")
         self.assertEqual(parsed[0].primary_reason, "Example rejection description.")
         self.assertEqual(parsed[0].dcn, "0000000123AZR")
@@ -298,6 +303,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp:
             source = Path(temp) / "synthetic.xlsx"
             book = Workbook()
+            book.active.title = 'NGS'
             sheet = book.active
             sheet.append(["Invoice No", "Insurance ID", "Statement Period Start Date",
                           "Statement Period End Date", "Invoice Amount", "Comments"])
@@ -353,8 +359,8 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(rows[1][headers.index("Sr #")], 1)
                     self.assertEqual(rows[1][headers.index("Current Reason for Non - Payment")],
                                      f"1. {long_reason}\n2. Different reason")
-                    self.assertEqual(rows[1][headers.index("Claim Status")], "1. Paid\n2. Suspense")
-                    self.assertEqual(rows[1][headers.index("Check Date")], "1. 06/10/2026\n2. ")
+                    self.assertEqual(rows[1][headers.index("Claim status")], "1. Paid\n2. PENDING")
+                    self.assertEqual(rows[1][headers.index("Payment/Check Date")], "1. 06/10/2026\n2. ")
                     self.assertEqual(rows[1][headers.index("StartDate")].date(), date(2026, 5, 1))
                     self.assertEqual(rows[1][headers.index("EndDate")].date(), date(2026, 5, 31))
                     self.assertEqual(rows[1][headers.index("AltPatientID")], "TEST-MBI-001")
@@ -367,17 +373,17 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(rows[1][headers.index("PaidAmount")], "1. $80.00\n2. ")
                     self.assertEqual(rows[1][headers.index("Adj.")], "1. $20.00\n2. ")
                     self.assertEqual(rows[1][headers.index("Balance")], "1. $20.00\n2. ")
-                    self.assertEqual(rows[1][headers.index("Pay. Status")], "1. Paid\n2. Suspense")
+                    self.assertEqual(rows[1][headers.index("Pay. Status")], "1. Paid\n2. PENDING")
                     self.assertEqual(rows[1][headers.index("TRN")], "1. 000123\n2. 000456")
                     self.assertEqual(report["Claims"]["P2"].number_format, "@")
-                    self.assertEqual(rows[1][headers.index("Claim ID")], "1. 000123\n2. 000456")
+                    self.assertEqual(rows[1][headers.index("Claim ID / TRN")], "1. 000123\n2. 000456")
                     self.assertEqual(report["Claims"]["W2"].number_format, "@")
                     self.assertEqual(rows[1][headers.index("Billed Amount")], "1. $100.00\n2. $100.00")
                     self.assertEqual(rows[1][headers.index("Visit/Supply/Expense")], 100)
-                    self.assertEqual(rows[1][headers.index("Paid Amount")], "1. $80.00\n2. ")
-                    self.assertEqual(rows[1][headers.index("Check Number")], "1. 0000123\n2. 0000123")
+                    self.assertEqual(rows[1][headers.index("Paid amount")], "1. $80.00\n2. ")
+                    self.assertEqual(rows[1][headers.index("Payment/Check Number")], "1. 0000123\n2. 0000123")
                     self.assertEqual(report["Claims"]["AD2"].number_format, "@")
-                    self.assertEqual(rows[1][headers.index("AutomationStatus")], "Pending")
+                    self.assertEqual(rows[1][headers.index("AutomationStatus")], "Done")
                     self.assertEqual(report["Claims"]["A1"].fill.fgColor.rgb, "003D5A73")
                     self.assertEqual(report["Claims"]["A1"].font.name, "Calibri")
                     self.assertEqual(report["Claims"].column_dimensions["AA"].width, 60)
@@ -385,21 +391,21 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(summary_values["Claims returned"], 2)
                     self.assertEqual(rows[2][headers.index("Sr #")], 2)
                     self.assertEqual(rows[2][headers.index("InvoiceNumber")], "INV-02")
-                    self.assertEqual(rows[2][headers.index("AutomationStatus")], "Not Found")
-                    self.assertIsNone(rows[2][headers.index("Claim ID")])
-                    self.assertEqual(rows[2][headers.index("Claim Status")], "Not Found")
+                    self.assertEqual(rows[2][headers.index("AutomationStatus")], "Done")
+                    self.assertIsNone(rows[2][headers.index("Claim ID / TRN")])
+                    self.assertEqual(rows[2][headers.index("Claim status")], "Not Found")
                     self.assertEqual(rows[2][headers.index("Pay. Status")], "Not Found")
                     self.assertIn("No portal claims", rows[2][headers.index("Note(s)/ Follow Up")])
                     available = {"Sr #", "Office", "Contract", "VisitDate", "Visit/Supply/Expense", "AutomationStatus", "PatientName", "InvoiceNumber", "Current Reason for Non - Payment",
-                                 "Invoice Date", "Amount", "PaidAmount", "Adj.", "Balance", "Pay. Status", "TRN", "StartDate", "EndDate", "Claim ID", "Billed Amount", "Paid Amount",
-                                 "AltPatientID", "Denial Reason", "Finalized Date", "Claim Status", "Check Number", "Check Date", "Note(s)/ Follow Up"}
+                                 "Invoice Date", "Amount", "PaidAmount", "Adj.", "Balance", "Pay. Status", "TRN", "StartDate", "EndDate", "Claim ID / TRN", "Billed Amount", "Paid amount",
+                                 "AltPatientID", "Denial Reason", "Finalized Date", "Claim status", "Payment/Check Number", "Payment/Check Date", "Note(s)/ Follow Up"}
                     for row in rows[1:]:
                         for header, value in zip(headers, row):
                             if header not in available:
                                 self.assertIsNone(value, header)
                     self.assertEqual(report["Claims"].auto_filter.ref, "A1:AH4")
-                    self.assertEqual(report.sheetnames, ["Claims", "Summary", "Results"])
-                    self.assertEqual(report.active.title, "Claims")
+                    self.assertEqual(report.sheetnames, ["NGS", "Claims", "Summary", "Results"])
+                    self.assertEqual(report.active.title, "NGS")
                     self.assertEqual(report["Results"].sheet_state, "hidden")
                     self.assertEqual(report["Claims"].freeze_panes, "A2")
                     self.assertTrue(report["Claims"]["O2"].alignment.wrap_text)
@@ -419,6 +425,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp:
             source = Path(temp) / "not-found-patient.xlsx"
             book = Workbook()
+            book.active.title = 'NGS'
             book.active.append([
                 "First Name", "Last Name", "Patient ID", "DOB", "Insurance ID",
                 "Invoice No", "Invoice Date", "Statement Period Start Date",
@@ -476,13 +483,14 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(row["VisitDate"], "05/01/2026 - 05/31/2026")
                     for header in ("Visit/Supply/Expense", "Amount", "Billed Amount", "Balance"):
                         self.assertEqual(row[header], 0, header)
-                    for header in ("Claim Status", "Pay. Status", "AutomationStatus"):
+                    self.assertEqual(row["AutomationStatus"], "Done")
+                    for header in ("Claim status", "Pay. Status"):
                         self.assertEqual(row[header], "Not Found", header)
                     self.assertIn("=Original invoice note", row["Note(s)/ Follow Up"])
                     self.assertIn("Original follow-up comment", row["Note(s)/ Follow Up"])
                     self.assertEqual(report["Claims"]["Q2"].data_type, "s")
-                    for header in ("PaidAmount", "Adj.", "TRN", "Claim ID", "Paid Amount",
-                                   "Finalized Date", "Check Number", "Check Date", "LastError"):
+                    for header in ("PaidAmount", "Adj.", "TRN", "Claim ID / TRN", "Paid amount",
+                                   "Finalized Date", "Payment/Check Number", "Payment/Check Date", "LastError"):
                         self.assertIsNone(row[header], header)
                     summary = dict(report["Summary"].iter_rows(min_row=3, values_only=True))
                     self.assertEqual(summary["Claims returned"], 0)
@@ -508,6 +516,7 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(headers=headers), tempfile.TemporaryDirectory(dir=ROOT) as temp:
                 source = Path(temp) / "not-found.xlsx"
                 book = Workbook()
+                book.active.title = 'NGS'
                 book.active.append(headers)
                 book.active.append(values)
                 book.save(source)
@@ -532,10 +541,10 @@ class MatchingTests(unittest.TestCase):
                         self.assertEqual(row["InvoiceNumber"], "000123")
                         self.assertEqual(row["PatientName"], patient_name)
                         self.assertEqual(row["AltPatientID"], patient_id)
-                        self.assertEqual(row["Claim Status"], "Not Found")
-                        self.assertEqual(row["AutomationStatus"], "Not Found")
+                        self.assertEqual(row["Claim status"], "Not Found")
+                        self.assertEqual(row["AutomationStatus"], "Done")
                         self.assertIsNone(row["Amount"])
-                        self.assertIsNone(row["Claim ID"])
+                        self.assertIsNone(row["Claim ID / TRN"])
                     finally:
                         report.close()
                 finally:
@@ -545,6 +554,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp:
             source = Path(temp) / "found-with-different-input.xlsx"
             book = Workbook()
+            book.active.title = 'NGS'
             book.active.append(["Invoice No", "Full Name", "DOB", "Invoice Date", "Invoice Amount",
                                 "Statement Period Start Date", "Statement Period End Date", "Comments"])
             book.active.append(["INV-01", "INPUT PATIENT", date(1970, 1, 2), date(2025, 1, 1),
@@ -570,13 +580,13 @@ class MatchingTests(unittest.TestCase):
                     rows = list(report["Claims"].iter_rows(values_only=True))
                     row = dict(zip(rows[0], rows[1]))
                     self.assertIsNone(row["PatientName"])
-                    self.assertIsNone(row["DOB"])
-                    self.assertIsNone(row["Invoice Date"])
+                    self.assertEqual(row["DOB"].date(), date(1970, 1, 2))
+                    self.assertEqual(row["Invoice Date"].date(), date(2025, 1, 1))
                     self.assertIsNone(row["Note(s)/ Follow Up"])
                     self.assertEqual(row["Amount"], 999)
                     self.assertEqual(row["Billed Amount"], 100)
                     self.assertEqual(row["VisitDate"], "05/01/2026 - 05/31/2026")
-                    self.assertEqual(row["Claim Status"], "Paid")
+                    self.assertEqual(row["Claim status"], "Paid")
                     self.assertEqual(row["AutomationStatus"], "Done")
                 finally:
                     report.close()
@@ -628,6 +638,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp:
             source = Path(temp) / "synthetic.xlsx"
             book = Workbook()
+            book.active.title = 'NGS'
             sheet = book.active
             sheet.append(["Invoice No", "Insurance ID", "Statement Period Start Date",
                           "Statement Period End Date", "Invoice Amount", "Comments", "ICN"])
@@ -655,7 +666,7 @@ class MatchingTests(unittest.TestCase):
                     headers = rows[0]
                     self.assertEqual(rows[1][headers.index("Comments")], v["comments"])
                     self.assertIn("PCN search complete", rows[1][headers.index("Claim Checker Comments")])
-                    self.assertIn("Check Date", headers)
+                    self.assertIn("Payment/Check Date", headers)
                 finally:
                     report.close()
                 self.assertEqual(source.read_bytes(), original)
