@@ -15,6 +15,7 @@ for folder in (ROOT / "src", ROOT.parent / "Kantime-engine-main" / "src"):
 
 from kantime_engine import RowRecord, RowResult, RowDisposition, PortalAutomationError, RecoveryAction, RetryScope
 from kantime_engine.runner import AutomationRunner
+from kantime_engine.ct_reporting import OUTPUT_FIELDS
 from kantime_engine.cancellation import CancellationToken
 from kantime_engine.paths import ApplicationPaths
 from kantime_engine.workbook import WorkbookSession
@@ -197,8 +198,9 @@ class MatchingTests(unittest.TestCase):
         self.assertIsNone(money(""))
         self.assertEqual(money("$0.00"), Decimal("0.00"))
         self.assertEqual(money("($1,234.56)"), Decimal("-1234.56"))
+        self.assertIsNone(money("NaN"))
         with self.assertRaises(ValueError):
-            money("NaN")
+            money("invalid currency")
 
     def test_table_parser_and_missing_payments(self):
         headers = ["MBI", "ICN", "From Date", "To Date", "Billed Amount", "Status"]
@@ -386,7 +388,7 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(rows[1][headers.index("AutomationStatus")], "Done")
                     self.assertEqual(report["Claims"]["A1"].fill.fgColor.rgb, "003D5A73")
                     self.assertEqual(report["Claims"]["A1"].font.name, "Calibri")
-                    self.assertEqual(report["Claims"].column_dimensions["AA"].width, 60)
+                    self.assertEqual(report["Claims"].column_dimensions["AA"].width, 50)
                     summary_values = dict(report["Summary"].iter_rows(min_row=3, values_only=True))
                     self.assertEqual(summary_values["Claims returned"], 2)
                     self.assertEqual(rows[2][headers.index("Sr #")], 2)
@@ -413,8 +415,9 @@ class MatchingTests(unittest.TestCase):
                         for cell in row:
                             for edge in (cell.border.left, cell.border.right, cell.border.top, cell.border.bottom):
                                 self.assertEqual(edge.style, "thin")
-                                self.assertEqual(edge.color.rgb, "00D9D9D9")
-                    self.assertGreater(report["Claims"].row_dimensions[2].height, 70)
+                                header = report["Claims"].cell(1, cell.column).value
+                                self.assertEqual(edge.color.rgb, "00D3D3D3" if header in OUTPUT_FIELDS else "00D9D9D9")
+                    self.assertEqual(report["Claims"].row_dimensions[2].height, 20)
                     self.assertEqual(len(report["Claims"].conditional_formatting), 1)
                 finally:
                     report.close()

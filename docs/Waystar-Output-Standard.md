@@ -1,0 +1,91 @@
+# Waystar output standard
+
+Applies only to Waystar Claim Checker. Derived from the supplied Multi-EMR master
+standard and the user's clarifications on 2026-11-05.
+
+## Priority and approved interpretation
+
+1. Preserve input header text, column positions, source data, formulas, tracking
+   history and unrelated worksheets. Write portal values only to the designated
+   verification columns. Never rename historical payment or status columns.
+2. Existing Last Action Taken/LAT and Recheck columns never move or lose their
+   values. When both Denial Reason and Last Action Taken are new, append them
+   adjacently in that order. Do not shift input columns to impose adjacency.
+3. Keep the actual verified Waystar Primary Reason description for fully paid
+   claims. This is the explicit approved exception to the master document's --
+   paid-reason example.
+4. Apply standard styling to matching output/tracking columns in the preserved
+   main worksheet and generated Claims/Results review sheets. Summary gridlines
+   are visible. Do not restyle unrelated worksheets from the input workbook.
+5. Preserve offset header rows instead of moving them to row 1.
+
+## Exact output headers
+
+Claim ID / TRN; Billed Amount; Paid amount; Claim status; Denial Reason;
+Last Action Taken (or existing LAT/alias); Finalized Date; Payment/Check Number;
+Payment/Check Date; Recheck.
+
+Paid amount and Claim status require exact casing. Historical Paid Amount,
+PaidAmount, Claim Status and ClaimStatus must not be overwritten or restyled as
+portal verification fields.
+
+## Input handling
+
+Use normalized point-of-use alias lookup, never header renaming. Support invoice,
+patient, amount, alternate ID and visit-date variants from HHAeXchange, AlayaCare
+and KanTime. Main automation and Not Found fallbacks share the relevant aliases.
+Preserve all duplicate columns. Lookup/import fallbacks consistently select the
+first occurrence, matching the reference's first-field behavior.
+
+Null, NaN and NaT markers are missing values, not searchable invoice identifiers
+or zero-dollar payments. Accept supported day-first dates and negative currency
+forms. Do not silently turn invalid financial data into zero.
+
+## Portal values
+
+Verify each returned PCN and reason description. Popup versus hover is detected
+from the claim cell, independent of agency and payer. Keep Paid reasons as stated
+above. Preserve real zero amounts. A known zero payment without a check number
+uses --; unknown check/payment values stay blank. Never fabricate a payment date.
+Multiple claims remain numbered within the same source invoice row.
+
+Recheck No/N/False/0 skips the search and preserves prior portal values. Yes or
+blank permits processing. Never rewrite the user's LAT or Recheck values.
+
+## Presentation
+
+- Header: Calibri 11 bold, D9E1F2 fill, 26pt height.
+- Data: Calibri 11, 20pt row height.
+- Standard cells: thin D3D3D3 borders. Gridlines visible on generated output sheets.
+- Currency: right aligned; multiline currency top aligned and wrapped.
+- Dates: centered; multiline dates top aligned and wrapped. Recheck centered.
+- Claim status: centered when short; left/top and wrapped when multiline or >25 chars.
+- Narrative fields: left aligned; top/wrapped when multiline or >20 chars.
+- Width: content length +3, clamped to each minimum below and maximum 50.
+
+| Field | Minimum width |
+|---|---:|
+| Claim ID / TRN | 16 |
+| Billed Amount | 14 |
+| Paid amount | 14 |
+| Claim status | 14 |
+| Denial Reason | 20 |
+| Last Action Taken / LAT | 20 |
+| Finalized Date | 14 |
+| Payment/Check Number | 16 |
+| Payment/Check Date | 14 |
+| Recheck | 12 |
+
+Maintain active YES,NO validation on Recheck data rows, including generated review
+sheets with that column. Keep unrelated validations intact.
+
+## Saving and verification
+
+Load existing XLSX with openpyxl and preserve formulas; construct a workbook only
+for CSV input. Save to a temporary file, close resources, then atomically replace
+the destination. Keep the previous report intact if saving fails.
+
+Regression coverage includes raw casing isolation, aliases, duplicate columns,
+tracking preservation, offset headers, CSV, multiple claims, styling, dropdowns,
+paid reasons, missing-value handling and failed-save protection. Browser tests use
+synthetic pages; they do not establish new live-portal validation.

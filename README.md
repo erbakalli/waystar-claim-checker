@@ -112,3 +112,26 @@ Pop-Location
 Keep `portal-profile.json` beside the executable. The example profile contains
 selectors only, without login information. Verify selectors against the portal
 layout used by your account before processing production workbooks.
+
+## Waystar master-standard interpretation
+
+Existing input headers, positions, tracking history, formulas and unrelated
+worksheets take priority over the reference's conflicting LAT reordering example.
+When both Denial Reason and Last Action Taken are missing, they are appended
+adjacently in that order. Existing LAT/Last Action Taken columns are never moved.
+
+The ten standard output/tracking columns use the reference's per-column minimum
+widths, maximum width 50, and multiline alignment in the main worksheet and in
+generated review sheets. Recheck validation is also present on generated sheets
+that contain that column. Summary gridlines are visible; unrelated input sheets
+retain their presentation. Standardized columns are the styling exception to
+preserving original input cell styles.
+
+For Waystar, keep the actual verified Primary Reason description even for fully
+paid claims (explicit user-approved exception). A known zero paid amount without
+a check number uses --; unknown payment/check values remain blank, and no dates
+or zero-dollar payments are invented. Missing input markers such as null, NaN and
+NaT are treated as missing. Duplicate-header fallbacks consistently use the first
+occurrence without deleting duplicate source columns.
+
+See [Waystar output standard](docs/Waystar-Output-Standard.md) for the scoped contract and approved interpretations.

@@ -153,3 +153,14 @@ Nga kjo dosje:
 Pas rindertimit, kopjo portal-profile.json ne dist.
 Kontrollet automatike perdorin te dhena testimi; verifikimi ne portal kerkon login-in tend.
 Per nje prove reale fillestare, vendos Claims per batch ne 1.
+
+## Master-standard alignment (Waystar)
+
+See the repository README's master-standard interpretation. Standard output
+columns in generated Claims/Results sheets now use the same blue headers,
+per-column minimum widths, 50-character maximum and multiline alignment as the
+preserved main sheet. Recheck dropdowns are applied to generated review sheets.
+Input aliases are shared with the Not Found fallback, including Client Name,
+Invoice #, Total Billed, Billed, Member ID, Client ID and DOS. Real Waystar reasons
+remain in Denial Reason for fully paid claims. Existing input column positions,
+LAT/Recheck values, formulas and unrelated input sheets remain preserved.

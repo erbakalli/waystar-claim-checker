@@ -306,7 +306,10 @@ class WorkbookSession:
         for ordinal, (_source_row, cells) in enumerate(iter_source_rows(run.snapshot_path, layout)):
             if ordinal >= run.row_count:
                 break
-            result = factory(dict(zip(layout.headers, cells)))
+            source_values = {}
+            for header, value in zip(layout.headers, cells):
+                source_values.setdefault(header, value)
+            result = factory(source_values)
             if result is not None:
                 self.store.import_completed(
                     run.id, ordinal, result_values=result.values, comment=result.comment,

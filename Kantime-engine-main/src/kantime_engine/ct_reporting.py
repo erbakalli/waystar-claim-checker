@@ -30,20 +30,28 @@ def recheck_disabled(value):
 def apply_ct_output_styling(ws, header_row=1, last_row=None):
     last_row = last_row or ws.max_row
     ws.sheet_view.showGridLines = True
+    minimum_widths = {"Claim ID / TRN": 16, "Billed Amount": 14, "Paid amount": 14,
+                      "Claim status": 14, "Denial Reason": 20, "Last Action Taken": 20,
+                      "Finalized Date": 14, "Payment/Check Number": 16,
+                      "Payment/Check Date": 14, "Recheck": 12}
+    columns = []
+    for cells in ws.iter_cols(min_row=header_row, max_row=last_row):
+        name = cells[0].value
+        if normalize_header(name) in {"lat", "lastactiontaken", "lastaction"}:
+            name = "Last Action Taken"
+        elif normalize_header(name) == "recheck":
+            name = "Recheck"
+        if name in OUTPUT_FIELDS:
+            columns.append((name, cells))
+    if not columns:
+        return
     ws.row_dimensions[header_row].height = 26
     for row in range(header_row + 1, last_row + 1):
         ws.row_dimensions[row].height = 20
     edge = Side(style="thin", color="D3D3D3")
     border = Border(left=edge, right=edge, top=edge, bottom=edge)
-    for cells in ws.iter_cols(min_row=header_row, max_row=last_row):
+    for name, cells in columns:
         header = cells[0]
-        name = header.value
-        if normalize_header(name) in {"lat", "lastactiontaken", "lastaction"}:
-            name = "Last Action Taken"
-        elif normalize_header(name) == "recheck":
-            name = "Recheck"
-        if name not in OUTPUT_FIELDS and name != "LAT":
-            continue
         header.font = Font(name="Calibri", size=11, bold=True, color="000000")
         header.fill = PatternFill("solid", fgColor="D9E1F2")
         header.border = border
@@ -51,12 +59,47 @@ def apply_ct_output_styling(ws, header_row=1, last_row=None):
         for cell in cells[1:]:
             cell.font = Font(name="Calibri", size=11)
             cell.border = border
-            currency = name in {"Billed Amount", "Paid amount"}
-            centered = name in {"Finalized Date", "Payment/Check Date", "Recheck", "Claim status"}
-            cell.alignment = Alignment(horizontal="right" if currency else "center" if centered else "left",
-                                       vertical="center", wrap_text=True)
-        length = max(len(line) for cell in cells for line in str(cell.value or "").split("\n"))
-        ws.column_dimensions[header.column_letter].width = min(50, max(12, length + 3))
+            text = str(cell.value) if cell.value is not None else ""
+            multiline = "\n" in text
+            if name in {"Billed Amount", "Paid amount"}:
+                horizontal, top = "right", multiline
+            elif name in {"Finalized Date", "Payment/Check Date"}:
+                horizontal, top = "center", multiline
+            elif name == "Recheck":
+                horizontal, top = "center", False
+            elif name == "Claim status":
+                top = multiline or len(text) > 25
+                horizontal = "left" if top else "center"
+            else:
+                top = multiline or len(text) > 20
+                horizontal = "left"
+            cell.alignment = Alignment(horizontal=horizontal,
+                                       vertical="top" if top else "center", wrap_text=top)
+        length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in cells)
+        ws.column_dimensions[header.column_letter].width = min(50, max(minimum_widths[name], length + 3))
+
+
+def _set_recheck_validation(ws, column, header_row, last_row):
+    letter = get_column_letter(column)
+    # Keep unrelated validations, including multi-column ranges, intact.
+    for validation in list(ws.data_validations.dataValidation):
+        ranges = []
+        for area in validation.ranges:
+            if area.min_col <= column <= area.max_col:
+                for left, right in ((area.min_col, column - 1),
+                                    (column + 1, area.max_col)):
+                    if left <= right:
+                        ranges.append(f"{get_column_letter(left)}{area.min_row}:{get_column_letter(right)}{area.max_row}")
+            else:
+                ranges.append(str(area))
+        if ranges:
+            validation.sqref = " ".join(ranges)
+        else:
+            ws.data_validations.dataValidation.remove(validation)
+    validation = DataValidation(type="list", formula1='"YES,NO"', allow_blank=True,
+                                showDropDown=False)
+    ws.add_data_validation(validation)
+    validation.add(f"{letter}{header_row + 1}:{letter}{last_row}")
 
 
 def _copy_report_sheet(source, workbook):
@@ -164,33 +207,19 @@ def generate_preserved_report(*, store, run, spec, statistics, detail_writer):
                                       else "@")
         last_row = max(ws.max_row, run.header_row + run.row_count)
         if last_row > run.header_row:
-            letter = get_column_letter(positions["Recheck"])
-            # Keep unrelated validations, including multi-column ranges, intact.
-            for validation in list(ws.data_validations.dataValidation):
-                ranges = []
-                for area in validation.ranges:
-                    if area.min_col <= positions["Recheck"] <= area.max_col:
-                        for left, right in ((area.min_col, positions["Recheck"] - 1),
-                                            (positions["Recheck"] + 1, area.max_col)):
-                            if left <= right:
-                                ranges.append(f"{get_column_letter(left)}{area.min_row}:{get_column_letter(right)}{area.max_row}")
-                    else:
-                        ranges.append(str(area))
-                if ranges:
-                    validation.sqref = " ".join(ranges)
-                else:
-                    ws.data_validations.dataValidation.remove(validation)
-            validation = DataValidation(type="list", formula1='"YES,NO"', allow_blank=True,
-                                        showDropDown=False)
-            ws.add_data_validation(validation)
-            validation.add(f"{letter}{run.header_row + 1}:{letter}{last_row}")
+            _set_recheck_validation(ws, positions["Recheck"], run.header_row, last_row)
         apply_ct_output_styling(ws, run.header_row, last_row)
         # Retain the existing multi-claim review and run-summary views as supplements.
         detail_writer(store=store, run=replace(run, output_path=str(details_path)),
                       spec=replace(spec, preserve_source_workbook=False), statistics=statistics)
         details = load_workbook(details_path)
         for sheet in details:
-            _copy_report_sheet(sheet, workbook)
+            copied = _copy_report_sheet(sheet, workbook)
+            apply_ct_output_styling(copied)
+            recheck_column = next((c.column for c in copied[1]
+                                   if normalize_header(c.value) == "recheck"), None)
+            if recheck_column and copied.max_row > 1:
+                _set_recheck_validation(copied, recheck_column, 1, copied.max_row)
         workbook.active = workbook.sheetnames.index(ws.title)
         ws.sheet_state = "visible"
         with temp.open("wb") as handle:

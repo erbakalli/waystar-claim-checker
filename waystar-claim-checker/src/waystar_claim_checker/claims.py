@@ -5,7 +5,16 @@ from decimal import Decimal, InvalidOperation
 import re
 
 
+def clean_input_value(value):
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    if isinstance(value, str) and value.strip().casefold() in {"", "nan", "nat", "none", "null"}:
+        return None
+    return value
+
+
 def identifier(value):
+    value = clean_input_value(value)
     if value is None:
         return ""
     if isinstance(value, float) and value.is_integer():
@@ -14,6 +23,7 @@ def identifier(value):
 
 
 def service_date(value):
+    value = clean_input_value(value)
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -30,6 +40,7 @@ def service_date(value):
 
 
 def money(value):
+    value = clean_input_value(value)
     if value is None or str(value).strip() in ("", "-", "N/A"):
         return None
     text = str(value).strip().replace("$", "").replace(",", "")

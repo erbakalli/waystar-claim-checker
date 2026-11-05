@@ -11,10 +11,19 @@ from kantime_engine import (
     RunPolicy, SheetRule, StatisticSpec, VariantSpec, WorkbookSpec, ResultSheetSpec,
     PortalAutomationError, RecoveryAction, RetryScope,
 )
-from .claims import identifier, money, service_date
+from .claims import identifier, money, service_date, clean_input_value
 from kantime_engine.spreadsheet_source import normalize_header
 from kantime_engine.ct_reporting import recheck_disabled
 from .pages import CLAIMS_URL, HH_CLAIMS_URL, ClaimsPage, load_profile
+
+# Shared point-of-use aliases; source headers and cells are never renamed.
+INPUT_ALIASES = {
+    "patient": ("Patient Name", "PatientName", "Client Name", "FullName", "Patient Full Name"),
+    "visit": ("Visit Date", "VisitDate", "Date of Service", "DOS", "Statement Period Start Date", "StartDate", "Stmt Start", "From Date"),
+    "invoice": ("Invoice #", "InvoiceNumber", "Invoice Number", "Invoice No", "PCN"),
+    "amount": ("Invoice Amount", "Amount", "Billed Amount", "Total Billed", "Billed", "Total Charges"),
+    "alt_id": ("Alt Patient ID", "AltPatientID", "Member ID", "Client ID", "Insurance ID", "Beneficiary ID", "MBI"),
+}
 
 OUTPUT_KEYS = ("office", "patient_full_name", "pcn", "stmt_start", "stmt_end", "total_charges",
                "primary_reason", "paid_date", "dcn_number",
@@ -74,14 +83,17 @@ def claim_output(claim, invoice_amount=None):
                 primary_reason=claim.primary_reason, paid_date=claim.paid_date, dcn_number=claim.dcn,
                 alt_patient_id=claim.beneficiary_id, claim_id=claim.dcn, paid_amount=claim.paid,
                 denial_reason=claim.primary_reason, finalized_date=claim.paid_date,
-                check_number=claim.check_number, check_date=claim.check_date, notes=claim.notes,
+                check_number=claim.check_number or ("--" if claim.paid == 0 else ""),
+                check_date=claim.check_date, notes=claim.notes,
                 claim_status=status)
 
 
 def not_found_output(source, result):
     """Keep source details on rows without portal claims, including unfinished rows."""
     not_found = result.get("claim_status") == "Not Found"
-    values = {normalize_header(header): value for header, value in source.items()}
+    values = {}
+    for header, value in source.items():
+        values.setdefault(normalize_header(header), clean_input_value(value))
 
     def read(*headers):
         for header in headers:
@@ -99,29 +111,29 @@ def not_found_output(source, result):
         except ValueError:
             return str(value).strip()
 
-    patient_name = read("PatientName", "Patient Name", "Patient Full Name", "Full Name")
+    patient_name = read(*INPUT_ALIASES["patient"])
     if patient_name is None:
         patient_name = " ".join(str(value).strip() for value in (
             read("First Name", "FirstName", "Patient First Name"),
             read("Last Name", "LastName", "Patient Last Name"),
         ) if value is not None)
-    start = read("Statement Period Start Date", "StartDate", "Start Date", "Stmt Start", "From Date")
+    start = read(*INPUT_ALIASES["visit"])
     end = read("Statement Period End Date", "EndDate", "End Date", "Stmt End", "To Date")
     period = " - ".join(value for value in (date_text(start), date_text(end)) if value)
-    amount = read("Invoice Amount", "Amount", "Billed Amount", "Total Charges")
+    amount = read(*INPUT_ALIASES["amount"])
     notes = ["Not Found in Waystar. Patient and invoice data shown from input."] if not_found else []
     for value in (read("Invoice Notes", "Invoice Note"), read("Comments", "Note(s)/ Follow Up", "Notes")):
         if value is not None and str(value).strip() not in notes:
             notes.append(str(value).strip())
     patient_id = read("Patient ID", "PatientID")
-    insurance_id = read("Insurance ID", "Beneficiary ID", "MBI", "AltPatientID")
+    insurance_id = read(*INPUT_ALIASES["alt_id"])
     if patient_id is not None and insurance_id is not None and str(patient_id) != str(insurance_id):
         notes.append(f"Patient ID (input): {patient_id}")
     return dict(
         contract=read("Contract", "Payer", "Insurance") or result.get("contract", ""),
         office=read("Office", "Agency", "Agency Name", "Office Name") or result.get("office", ""),
         patient_full_name=patient_name,
-        pcn=read("Invoice No", "Invoice Number", "InvoiceNumber", "PCN"),
+        pcn=read(*INPUT_ALIASES["invoice"]),
         dob=read("DOB", "Date of Birth", "Birth Date"),
         alt_patient_id=insurance_id if insurance_id is not None else patient_id,
         invoice_date=read("Invoice Date", "InvoiceDate"),
@@ -191,11 +203,11 @@ def resume_from_excel(source):
 WORKBOOK = WorkbookSpec(
     key_column="invoice_no",
     columns=(
-        ColumnSpec("invoice_no", "Invoice No", aliases=("Invoice Number", "InvoiceNumber", "Invoice #"), required=True, format=ColumnFormat.TEXT),
-        ColumnSpec("insurance_id", "Insurance ID", aliases=("Beneficiary ID", "MBI", "Alt Patient ID", "Member ID", "Client ID", "Medicare ID"), format=ColumnFormat.TEXT),
-        ColumnSpec("service_from", "Statement Period Start Date", aliases=("StartDate", "Visit Date", "Date of Service", "DOS"), format=ColumnFormat.DATE),
+        ColumnSpec("invoice_no", "Invoice No", aliases=INPUT_ALIASES["invoice"], required=True, format=ColumnFormat.TEXT),
+        ColumnSpec("insurance_id", "Insurance ID", aliases=INPUT_ALIASES["alt_id"] + ("Medicare ID",), format=ColumnFormat.TEXT),
+        ColumnSpec("service_from", "Statement Period Start Date", aliases=INPUT_ALIASES["visit"], format=ColumnFormat.DATE),
         ColumnSpec("service_to", "Statement Period End Date", aliases=("EndDate",), format=ColumnFormat.DATE),
-        ColumnSpec("invoice_amount", "Invoice Amount", aliases=("Amount", "Total Billed", "Billed", "Billed Amount"), format=ColumnFormat.CURRENCY),
+        ColumnSpec("invoice_amount", "Invoice Amount", aliases=INPUT_ALIASES["amount"], format=ColumnFormat.CURRENCY),
         ColumnSpec("source_contract", "Contract", aliases=("Payer", "Insurance"), format=ColumnFormat.TEXT),
         ColumnSpec("recheck", "Recheck", format=ColumnFormat.TEXT),
         ColumnSpec("icn", "ICN", format=ColumnFormat.TEXT),
@@ -242,7 +254,7 @@ WORKBOOK = WorkbookSpec(
     hide_source_results=True,
     compact_summary=True,
     save_copy_if_locked=True,
-    processing_revision="multi-emr-ct-v7-auto-portal",
+    processing_revision="multi-emr-ct-v8-standard-alignment",
     preserve_source_workbook=True,
     resume_result_factory=resume_from_excel,
 )

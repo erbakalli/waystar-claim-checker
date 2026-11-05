@@ -474,7 +474,8 @@ def _generate_report(
                     source_current = next(source_iterator, None)
                 if source_current is None or source_current[0] != persisted.source_row:
                     raise ReportError("Saved input row is missing from the source snapshot")
-                source_data = dict(zip(headers, source_current[1]))
+                for header, value in zip(headers, source_current[1]):
+                    source_data.setdefault(header, value)
             records = persisted.result.get(sheet_spec.result_key, [])
             if not isinstance(records, list):
                 raise ReportError("Result sheet records must be a list")
@@ -507,7 +508,9 @@ def _generate_report(
             for record in records:
                 if not isinstance(record, dict):
                     raise ReportError("Result sheet rows must be mappings")
-                source_values = {normalize_header(key): value for key, value in source_data.items()}
+                source_values = {}
+                for key, value in source_data.items():
+                    source_values.setdefault(normalize_header(key), value)
                 cells = []
                 row_values = []
                 for column in detail_columns:
