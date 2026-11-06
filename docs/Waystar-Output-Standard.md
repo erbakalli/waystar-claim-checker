@@ -43,9 +43,12 @@ forms. Do not silently turn invalid financial data into zero.
 
 ## Portal values
 
-Verify each returned PCN and reason description. Use click for resolved HH Medicare
-and Palmetto GBA; use title/hover for NGS. No manual payer selection is required.
-When Payor is unavailable, retain cell-based detection. Keep Paid reasons as stated
+Verify each returned PCN and reason description. Detect click versus title/hover
+from each claim cell for NGS, Palmetto GBA and HH Medicare; never choose the method
+from the Office or Payor label. Explicit popup links are clicked; otherwise read a
+valid title or fresh tooltip, then try a generic clickable code if no tooltip appears.
+Verify the popup code, read its current description and close it before continuing.
+Do not reuse an earlier iframe document or accept an unverified reason. Keep Paid reasons as stated
 above. Preserve real zero amounts. A known zero payment without a check number
 uses --; unknown check/payment values stay blank. Never fabricate a payment date.
 Multiple claims remain numbered within the same source invoice row.

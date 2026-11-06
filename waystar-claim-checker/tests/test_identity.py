@@ -24,7 +24,7 @@ from waystar_claim_checker.pages import ClaimsPage
 
 
 class IdentityTests(unittest.TestCase):
-    def test_automatic_search_receives_each_resolved_payor(self):
+    def test_automatic_search_preserves_each_resolved_payor(self):
         for payor in ('HH - Medicare', 'Palmetto GBA', 'NGS'):
             with self.subTest(payor=payor):
                 app = create_application()
@@ -34,9 +34,9 @@ class IdentityTests(unittest.TestCase):
                     page.return_value.search.return_value = []
                     result = app.automation.process_row(RowRecord(2, 'INV', {
                         'invoice_no': 'INV', 'source_payor': payor}), context)
-                    self.assertEqual(page.return_value.payor, canonical_payor(payor))
                     page.return_value.search.assert_called_once_with('INV')
                 self.assertEqual(result.disposition, RowDisposition.RESOLVED)
+                self.assertEqual(result.values["contract"], canonical_payor(payor))
 
     def test_three_payors_are_normalized_without_treating_an_office_as_a_payor(self):
         for source, expected in (("National Government Services", "NGS"),

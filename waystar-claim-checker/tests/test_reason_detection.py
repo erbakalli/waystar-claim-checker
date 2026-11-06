@@ -59,53 +59,79 @@ for (const id of ['hover1','hover2']) {
 
 
 class ReasonDetectionTests(unittest.TestCase):
-    def test_resolved_payor_controls_click_or_hover_without_a_payer_selector(self):
+    def test_all_payors_detect_generic_click_cells_and_hover_links(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="msedge", headless=True)
             try:
                 page = browser.new_page()
                 def route(request):
                     if urlparse(request.request.url).path.endswith('/reason.aspx'):
-                        body = '<div>Reason Code: U5235</div><textarea>Verified popup description</textarea>'
+                        reason_id = parse_qs(urlparse(request.request.url).query)['reasonid'][0]
+                        description = 'Second popup description' if reason_id == '2' else 'Verified popup description'
+                        body = f'<div>Reason Code: U5235</div><textarea>{description}</textarea>'
                     else:
                         body = HTML
                     request.fulfill(body=body, content_type='text/html')
                 page.route('**/*', route)
                 variant = create_application().spec.automation.variants[-1]
                 for payor in ('HH Medicare', 'Palmetto GBA', 'NGS'):
-                    for target in ('anchor', 'cell'):
+                    for target in ('anchor', 'cell', 'hover-link'):
                         with self.subTest(payor=payor, target=target):
-                            page.goto('https://analytics.ecorpnet.com/member/payer-policy-test')
+                            page.goto('https://analytics.ecorpnet.com/member/adaptive-reason-test')
                             page.evaluate('''target => {
                                 const cell=document.querySelector('#popup1');
-                                cell.title='Verified NGS hover description';
-                                if (target === 'anchor') {
+                                cell.removeAttribute('title');
+                                if (target === 'anchor' || target === 'hover-link') {
                                     const a=cell.querySelector('a');
                                     a.href='#';
                                     a.onclick=e=>{e.preventDefault();openReason('reason.aspx?reasonid=1')};
+                                    if (target === 'hover-link') {
+                                        const tip=document.querySelector('[role=tooltip]');
+                                        cell.onmouseenter=()=>{tip.textContent='Verified hover description';tip.hidden=false};
+                                        cell.onmouseleave=()=>{tip.hidden=true};
+                                    }
                                 } else {
                                     cell.textContent='U5235';
+                                    cell.style.cursor='pointer';
                                     cell.addEventListener('click',()=>openReason('reason.aspx?reasonid=1'));
                                 }
                             }''', target)
                             token = CancellationToken()
                             adapter = ClaimsPage(SimpleNamespace(page=page, cancellation=token,
                                 actions=BrowserActions(token, default_timeout_ms=1000), variant=variant), {})
-                            adapter.payor = payor
-                            expected = ('Verified NGS hover description' if payor == 'NGS'
+                            adapter.payor = payor  # Must never control the interaction.
+                            expected = ('Verified hover description' if target == 'hover-link'
                                         else 'Verified popup description')
                             self.assertEqual(adapter.read_primary_reason(page.locator('#popup1'), 'U5235'), expected)
-                            self.assertEqual(page.evaluate('events'), [] if payor == 'NGS' else ['open:1', 'close'])
+                            self.assertEqual(page.evaluate('events'), [] if target == 'hover-link' else ['open:1', 'close'])
                             self.assertFalse(page.locator('.RadWindow').is_visible())
-                # A click payer must not silently export an available tooltip
-                # when its required popup does not open.
+                # Reuse a popup iframe for the same code with a different reason
+                # description. The old iframe document remains until navigation.
+                page.goto('https://analytics.ecorpnet.com/member/adaptive-reason-test')
+                page.evaluate('''() => {
+                    const cell=document.querySelector('#popup1'), a=cell.querySelector('a');
+                    cell.removeAttribute('title'); a.href='#'; let clicks=0;
+                    a.onclick=e=>{
+                        e.preventDefault(); clicks++;
+                        if (clicks===1) openReason('reason.aspx?reasonid=1');
+                        else {
+                            document.querySelector('.RadWindow').hidden=false;
+                            setTimeout(()=>document.querySelector('iframe').src='reason.aspx?reasonid=2',350);
+                        }
+                    };
+                }''')
+                self.assertEqual(adapter.read_primary_reason(page.locator('#popup1'), 'U5235'),
+                                 'Verified popup description')
+                self.assertEqual(adapter.read_primary_reason(page.locator('#popup1'), 'U5235'),
+                                 'Second popup description')
+                self.assertFalse(page.locator('.RadWindow').is_visible())
                 adapter.payor = 'HH Medicare'
-                with self.assertRaises(ValueError):
-                    adapter.read_primary_reason(page.locator('#native'), 'U3000')
+                self.assertEqual(adapter.read_primary_reason(page.locator('#native'), 'U3000'),
+                                 'Native description for this claim')
             finally:
                 browser.close()
 
-    def test_both_payers_handle_mixed_click_hover_and_titles_in_either_order(self):
+    def test_all_portal_variants_handle_mixed_click_hover_and_titles_in_either_order(self):
         self.run_detection()
 
     def test_wrong_popup_code_is_closed_and_never_replaced_with_hover(self):

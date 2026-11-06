@@ -94,13 +94,14 @@ Pay. Status merr Claim Status dhe TRN merr DCN nga portali, duke ruajtur zerot n
 AltPatientID merr Beneficiary ID; StartDate dhe EndDate marrin Stmt Start dhe Stmt End.
 Claim ID merr DCN; Billed Amount merr Total Charges dhe Claim Status merr statusin e portalit.
 Denial Reason merr pershkrimin e Primary Reason, jo kodin numerik.
-Primary Reason uses click for HH Medicare and Palmetto GBA and title/hover for NGS.
-The Payor is resolved automatically from the file and portal, without a GUI selector.
-Generic code anchors and clickable cells are supported even when their attributes
-omit reason.aspx. The popup reason code must match the claim; the checker reads
-its description, closes X and waits for closure. Missing or ambiguous popups fail
-the invoice without substituting a tooltip. Unknown Payor retains cell-based
-detection. Each row is checked separately to avoid reusing a previous description.
+Primary Reason is detected per cell for all three payors, independent of agency
+or payer labels. Explicit reason.aspx links open a popup; other cells use a
+valid descriptive title or fresh hover tooltip. If hovering exposes no tooltip,
+a generic code link, button or clickable cell is tried. The popup must contain
+the matching reason code and a valid description, then close before continuing.
+Previously loaded iframe documents cannot supply the next claim's description.
+Missing or ambiguous targets, mismatched codes and broken popups fail the invoice
+rather than exporting unverified data. No manual payer selection is required.
 Per cdo Invoice No lexohen te gjitha rreshtat e kthyer dhe faqet pasuese te grid-it,
 pastaj kerkohet fatura tjeter. Log-u tregon pritjen e kerkimit dhe Primary Reason per cdo claim.
 Nese nje faqe ose reason nuk lexohet, fatura nuk ruhet si e perfunduar me rezultate te pjesshme.

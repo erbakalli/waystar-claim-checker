@@ -83,11 +83,13 @@ worksheet to process. Office and Payor values are resolved from input rows and e
 labels. Conflicts are flagged for review before searching; no payer is inferred
 from the portal hostname or office name.
 
-Primary Reason uses click for HH Medicare and Palmetto GBA, and title/hover
-for NGS, based on the automatically resolved file/portal Payor. No payer selector
-is required. Click popups must match the reason code and close before continuing;
-a missing popup fails the invoice instead of substituting a tooltip. If the Payor
-is unavailable, the checker retains cell-based detection.
+Primary Reason detection is automatic for NGS, Palmetto GBA and HH Medicare.
+Each cell is checked separately: explicit reason popup links are clicked; other
+cells use a descriptive title or a fresh hover tooltip. If no tooltip appears,
+a generic clickable code is opened and its popup description is verified against
+the code. Popups close before continuing. Missing, ambiguous or mismatched
+reasons fail the invoice for retry instead of exporting an unverified description.
+No agency or payer selection is required, and mixed click/hover rows are supported.
 
 The interface shows the current claim and an animated loading indicator during
 preparation, automation, export and stopping. Detailed events remain in the

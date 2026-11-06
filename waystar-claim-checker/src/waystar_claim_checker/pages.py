@@ -3,11 +3,11 @@ import json
 import re
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from playwright.sync_api import TimeoutError as BrowserTimeout
 
 from kantime_engine import PortalAutomationError, RecoveryAction, RetryScope, BrowserSpec
 from kantime_engine.cancellation import CancellationRequested
 from .claims import header_indexes, parse_table
-from .identity import canonical_payor
 
 CLAIMS_URL = (
     "https://mgmt.zirmed.com/ExternalUserManagement/IntegrationRedirect/Index"
@@ -907,19 +907,13 @@ class ClaimsPage:
         self.context.cancellation.raise_if_cancelled()
         if not str(code).strip():
             return ""
-        payor = canonical_payor(getattr(self, "payor", ""))
+        # Detect every cell independently: all supported payors can use either
+        # interaction, including mixed rows in the same search result.
         link = cell.locator('a[href*="reason.aspx" i]:visible, [onclick*="reason.aspx" i]:visible')
         link_count = link.count()
-        if payor in ("HH Medicare", "Palmetto GBA") and not link_count:
-            # Some portals attach the popup handler to a generic anchor or the
-            # code cell, without exposing reason.aspx in the HTML attributes.
-            link = cell.locator('a:visible, button:visible, [role="button"]:visible, [onclick]:visible')
-            link_count = link.count()
-            if not link_count:
-                link, link_count = cell, 1
-        if payor != "NGS" and link_count > 1:
+        if link_count > 1:
             raise ValueError("Primary Reason has multiple description popup targets")
-        if payor != "NGS" and link_count == 1:
+        if link_count == 1:
             self.progress("Primary Reason uses a clickable description popup.", "claims.reason_method_click")
             # A broken popup must fail the invoice; never silently accept its title.
             return self.read_reason_window(link, link.inner_text().strip())
@@ -932,6 +926,13 @@ class ClaimsPage:
             title = titled.get_attribute("title")
             if self.is_reason_description(title) and title.strip().casefold() != str(code).strip().casefold():
                 return title.strip()
+        # Generic links may be hover-only. Probe their tooltip before clicking;
+        # a pointer-style cell also supports handlers registered in JavaScript.
+        generic = cell.locator('a:visible, button:visible, [role="button"]:visible, [onclick]:visible')
+        generic_count = generic.count()
+        cell_clickable = (not generic_count and cell.evaluate(
+            "el => typeof el.onclick === 'function' || el.getAttribute('role') === 'button' || getComputedStyle(el).cursor === 'pointer'"
+        ) is True)
         selector = self.profile.get("reason_tooltip") or '[role="tooltip"]:visible, .RadToolTip:visible'
         # Move away before the next hover so the previous row's tooltip cannot be reused.
         self.context.page.mouse.move(0, 0)
@@ -940,7 +941,17 @@ class ClaimsPage:
         self.context.actions.wait_visible(cell)
         self.context.cancellation.raise_if_cancelled()
         cell.hover(timeout=30_000)
-        self.context.actions.wait_visible(tooltip)
+        try:
+            self.context.actions.wait_visible(tooltip, timeout_ms=1500 if generic_count or cell_clickable else None)
+        except (TimeoutError, BrowserTimeout):
+            self.context.cancellation.raise_if_cancelled()
+            if generic_count > 1:
+                raise ValueError("Primary Reason has multiple description popup targets") from None
+            if generic_count == 1 or cell_clickable:
+                target = generic if generic_count else cell
+                self.progress("Primary Reason uses a clickable description popup.", "claims.reason_method_click")
+                return self.read_reason_window(target, target.inner_text().strip())
+            raise
         if tooltip.count() != 1:
             raise ValueError("Multiple reason tooltips")
         text = tooltip.inner_text().strip()
@@ -965,6 +976,18 @@ class ClaimsPage:
             return list({id(surface): surface for surface in
                          [self.page, self.context.page, *self.context.page.frames]}.values())
 
+        # A hidden iframe may still contain the previous claim's description.
+        # Do not accept its old document while the newly clicked popup loads.
+        previous_documents = {}
+        for surface in surfaces():
+            if urlparse(_surface_url(surface)).path.lower().endswith('/reason.aspx'):
+                try:
+                    previous_documents[id(surface)] = surface.evaluate('() => performance.timeOrigin')
+                except CancellationRequested:
+                    raise
+                except Exception:
+                    pass
+
         def read():
             nonlocal description
             self.context.cancellation.raise_if_cancelled()
@@ -973,6 +996,9 @@ class ClaimsPage:
                 is_reason_frame = (address.path.lower().endswith("/reason.aspx")
                                    and (reason_id is None or parse_qs(address.query).get("reasonid") == [reason_id]))
                 try:
+                    if (is_reason_frame and id(surface) in previous_documents
+                            and surface.evaluate('() => performance.timeOrigin') == previous_documents[id(surface)]):
+                        continue
                     text = surface.evaluate("""({code, frame}) => {
                         const roots = frame ? [document.body] :
                             [...document.querySelectorAll('.RadWindow, [role="dialog"]')];
