@@ -25,7 +25,7 @@ from waystar_claim_checker.pages import load_profile
 from openpyxl import Workbook, load_workbook
 
 EXPECTED_CLAIM_HEADERS = (
-    "Sr #", "PatientName", "Office", "Contract", "VisitDate", "Visit/Supply/Expense",
+    "Sr #", "PatientName", "Office", "Payor", "VisitDate", "Visit/Supply/Expense",
     "InvoiceNumber", "Invoice Date", "Units", "Amount", "PaidAmount", "Adj.",
     "Balance", "Pay. Status", "Current Reason for Non - Payment", "TRN",
     "Note(s)/ Follow Up", "AltPatientID", "Representative", "DOB", "StartDate",
@@ -357,7 +357,7 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(len(rows), 4)
                     self.assertEqual([row[headers.index("Office")] for row in rows[1:]],
                                      ["Arizona Home Care", "Arizona Home Care", None])
-                    self.assertEqual([row[headers.index("Contract")] for row in rows[1:]], ["NGS", "NGS", None])
+                    self.assertEqual([row[headers.index("Payor")] for row in rows[1:]], ["NGS", "NGS", None])
                     self.assertEqual(rows[1][headers.index("Sr #")], 1)
                     self.assertEqual(rows[1][headers.index("Current Reason for Non - Payment")],
                                      f"1. {long_reason}\n2. Different reason")
@@ -398,7 +398,7 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(rows[2][headers.index("Claim status")], "Not Found")
                     self.assertEqual(rows[2][headers.index("Pay. Status")], "Not Found")
                     self.assertIn("No portal claims", rows[2][headers.index("Note(s)/ Follow Up")])
-                    available = {"Sr #", "Office", "Contract", "VisitDate", "Visit/Supply/Expense", "AutomationStatus", "PatientName", "InvoiceNumber", "Current Reason for Non - Payment",
+                    available = {"Sr #", "Office", "Payor", "VisitDate", "Visit/Supply/Expense", "AutomationStatus", "PatientName", "InvoiceNumber", "Current Reason for Non - Payment",
                                  "Invoice Date", "Amount", "PaidAmount", "Adj.", "Balance", "Pay. Status", "TRN", "StartDate", "EndDate", "Claim ID / TRN", "Billed Amount", "Paid amount",
                                  "AltPatientID", "Denial Reason", "Finalized Date", "Claim status", "Payment/Check Number", "Payment/Check Date", "Note(s)/ Follow Up"}
                     for row in rows[1:]:

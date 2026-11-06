@@ -516,7 +516,8 @@ def _generate_report(
                 for column in detail_columns:
                     value = (shared_values.get(column.spec.key) if column.spec.key in sheet_spec.shared_columns
                              else record.get(column.spec.key, sheet_spec.missing_values.get(column.spec.key)))
-                    if value is None or (isinstance(value, str) and not value.strip()):
+                    if ((value is None or (isinstance(value, str) and not value.strip()))
+                            and not (persisted.result.get("identity_conflict") and column.spec.key in {"office", "contract"})):
                         for header in sheet_spec.source_fallback_columns.get(column.spec.key, ()):
                             candidate = source_values.get(normalize_header(header))
                             if candidate is not None and (not isinstance(candidate, str) or candidate.strip()):

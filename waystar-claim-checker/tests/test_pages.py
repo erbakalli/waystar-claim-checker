@@ -69,10 +69,11 @@ class PortalTests(unittest.TestCase):
                 context = SimpleNamespace(variant=variant, logger=Mock())
                 with patch("waystar_claim_checker.application.load_profile", return_value={}), \
                         patch("waystar_claim_checker.application.ClaimsPage") as page:
-                    page.return_value.read_office.side_effect = AssertionError("Account heading is unavailable")
+                    page.return_value.read_office.return_value = ""
+                    page.return_value.read_payor.return_value = ""
                     automation.prepare_portal(context)
                     page.return_value.open.assert_called_once_with()
-                    page.return_value.read_office.assert_not_called()
+                    page.return_value.read_office.assert_called_once_with()
                 expected = ""
                 self.assertEqual(automation.office, expected)
 
@@ -81,6 +82,7 @@ class PortalTests(unittest.TestCase):
         adapter.context.variant = create_application().resolve("Any agency", "HH - Medicare")
         frame.url = "https://analytics.ecorpnet.com/member/SelectSummary.aspx"
         adapter = ClaimsPage(adapter.context, adapter.profile)
+        adapter._identity_text = lambda surface: surface.locator("body").inner_text(timeout=500)
         self.assertIs(adapter.page, frame)
         self.assertFalse(adapter.signed_out())
         adapter.open()
@@ -95,6 +97,7 @@ class PortalTests(unittest.TestCase):
         adapter, locators = self.adapter()
         adapter.context.variant = create_application().resolve("Any agency", "HH - Medicare")
         adapter = ClaimsPage(adapter.context, adapter.profile)
+        adapter._identity_text = lambda surface: surface.locator("body").inner_text(timeout=500)
         locators["#search"].is_visible.return_value = True
         self.assertTrue(adapter.signed_out())
         with patch.object(adapter, "select_pcn"):
@@ -275,7 +278,9 @@ class PortalTests(unittest.TestCase):
         context.actions.fill.side_effect = lambda locator, value: setattr(
             locator.input_value, "return_value", str(value))
         context.actions.wait_for_any.return_value = "search"
-        return ClaimsPage(context, profile), locators
+        adapter = ClaimsPage(context, profile)
+        adapter._identity_text = lambda surface: surface.locator("body").inner_text(timeout=500)
+        return adapter, locators
 
     def embedded_adapter(self):
         adapter, locators = self.adapter()

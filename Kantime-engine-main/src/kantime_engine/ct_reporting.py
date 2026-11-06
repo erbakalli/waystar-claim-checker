@@ -175,11 +175,33 @@ def generate_preserved_report(*, store, run, spec, statistics, detail_writer):
                 ws.cell(run.header_row, index, name)
                 matches = [index]
             positions[name] = matches[0]
+        metadata_positions = {}
+        for name, key in spec.metadata_columns.items():
+            column = next((c.column for c in ws[run.header_row] if c.value == name), None)
+            if column is None:
+                column = ws.max_column + 1
+                ws.cell(run.header_row, column, name)
+            metadata_positions[name] = (column, key)
         for persisted in store.iter_rows(run.id):
             row = persisted.source_row
             if recheck_disabled(ws.cell(row, positions["Recheck"]).value):
                 continue
             result = persisted.result
+            for name, (column, key) in metadata_positions.items():
+                cell = ws.cell(row, column)
+                # Existing input identity is evidence, never silently overwritten.
+                if key != "identity_review" and cell.value is not None and str(cell.value).strip():
+                    continue
+                value = result.get(key, "")
+                if key == "identity_review" and not value:
+                    missing = [label for label, (index, field) in metadata_positions.items()
+                               if field != "identity_review" and not str(ws.cell(row, index).value or "").strip()]
+                    if missing:
+                        value = "Missing metadata: " + ", ".join(missing) + ". Review the file/portal identity."
+                if isinstance(value, str):
+                    cell.value = value or None
+                    cell.data_type = "s"
+                    cell.number_format = "@"
             records = result.get(spec.result_sheets[0].result_key, []) if spec.result_sheets else []
             if records:
                 values = _group_detail_records(records, spec.result_sheets[0])

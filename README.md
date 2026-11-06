@@ -79,8 +79,9 @@ The desktop interface no longer requires Agency or Payer / Automation selection.
 Open the Claims portal to check in Waystar before starting. The application
 recognizes the supported ClaimsEditor and Analytics integrations and reuses a
 ready Claims page. If multiple NGS/Medicare worksheets match, it asks which
-worksheet to process. Office and Contract values come from the input rows rather
-than a fixed agency or an inferred payer.
+worksheet to process. Office and Payor values are resolved from input rows and explicit portal identity
+labels. Conflicts are flagged for review before searching; no payer is inferred
+from the portal hostname or office name.
 
 Each claim's Primary Reason cell determines how its description is read. A
 recognized popup link takes priority; otherwise the checker reads a native title
@@ -135,3 +136,10 @@ NaT are treated as missing. Duplicate-header fallbacks consistently use the firs
 occurrence without deleting duplicate source columns.
 
 See [Waystar output standard](docs/Waystar-Output-Standard.md) for the scoped contract and approved interpretations.
+
+Office and Payor detection supports NGS, Palmetto GBA and HH Medicare. Output
+metadata includes Identity Review; conflicting file/portal identity is not guessed.
+The Claims review sheet now labels the payer column Payor and can still import
+older Contract headers. Blank identity remains reviewable rather than defaulting
+to NGS. The optional verified portal-profile payor_selector can target a payer
+label when the portal does not expose a standard Payer:/Payor:/Contract: label.

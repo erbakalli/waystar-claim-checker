@@ -89,3 +89,27 @@ Regression coverage includes raw casing isolation, aliases, duplicate columns,
 tracking preservation, offset headers, CSV, multiple claims, styling, dropdowns,
 paid reasons, missing-value handling and failed-save protection. Browser tests use
 synthetic pages; they do not establish new live-portal validation.
+
+## Office and Payor identity (2026-11-06)
+
+The output includes Office, Payor and Identity Review metadata. Supported canonical
+payors are NGS, Palmetto GBA and HH Medicare. MD Home Health is an Office, not a
+fourth payer and not sufficient on its own to infer HH Medicare.
+
+Read file Payor/Payer/Contract/Insurance and Office/Agency fields, including
+separate Payer/Insurance values when an existing Payor/Contract column is blank. Use explicit
+portal payer labels and the active Account office heading as fallback evidence.
+Portal identity is refreshed before each invoice after initial capture so an
+account switch cannot reuse cached office/payer values. Recognized aliases are
+normalized, never inferred from the portal hostname or a
+reason/claim note. Different file/portal identities leave the invoice Retry later,
+with an Identity Review explanation, before any claim search is attempted.
+Missing or unrecognized identity is visibly marked for review, not silently
+replaced with NGS or an agency-specific default.
+
+Existing input metadata cells and header positions remain intact. Blank/missing
+Office and Payor cells can be filled from resolved evidence; conflicting source
+values remain as source evidence with the review marker. The supplemental Claims
+sheet exposes the resolved Payor (legacy Contract headers remain importable).
+Saved rows with an Identity Review warning require rechecking rather than being
+silently imported as complete.

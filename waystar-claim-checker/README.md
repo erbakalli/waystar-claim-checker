@@ -8,7 +8,8 @@ Payer selection has also been removed. The app detects a visible Claims search
 on either supported integration. Open the Claims portal you want to check before
 starting. When more than one candidate is visible, it stops instead of guessing.
 Choose the worksheet when prompted if more than one Medicare/NGS sheet matches.
-Contract values come from the input Contract, Payer or Insurance column; a payer
+Office and Payor values are read from input identity columns or explicit portal
+labels; conflicting values are flagged for review before searching. A payer
 is never inferred from the portal hostname. A new browser starts at the standard
 Claims integration; navigate inside Waystar to the Claims portal you need.
 
@@ -45,7 +46,7 @@ Te Browser zgjidh njeren nga dy menyrat:
 2. Kliko Open Browser dhe kryej login/MFA ne Waystar.
    NGS hap integrimin tabappid=87 (claimseditor.ecorpnet.com).
    HH - Medicare hap integrimin tabappid=85 (analytics.ecorpnet.com).
-   Portali zbulohet nga faqja Claims e hapur; Office merret nga rreshti ne input.
+   Portali zbulohet nga faqja Claims e hapur; Office merret nga input-i ose Account i portalit, duke shenuar konfliktet per kontroll.
    Kjo lidhje nuk ndryshon automatikisht Account-in ne Waystar.
    Open Browser punon edhe pa Excel te zgjedhur; perdor tab-in Waystar te hapur
    ose hap nje tab te ri ne Edge ekzistues. Tab-et e tjera nuk ndryshohen.
@@ -164,3 +165,12 @@ Input aliases are shared with the Not Found fallback, including Client Name,
 Invoice #, Total Billed, Billed, Member ID, Client ID and DOS. Real Waystar reasons
 remain in Denial Reason for fully paid claims. Existing input column positions,
 LAT/Recheck values, formulas and unrelated input sheets remain preserved.
+
+## Office and Payor detection
+
+Office and Payor are read from source columns and explicit portal identity labels.
+NGS, Palmetto GBA and HH Medicare are the three payor labels; MD Home Health is an
+Office. Missing values fall back to the portal Account/Payer information. Conflicts
+are marked Identity Review and the invoice is left for retry without searching.
+Original source identity is preserved; the Claims sheet shows resolved Payor.
+If portal identity cannot be read, the output warns rather than fabricating it.

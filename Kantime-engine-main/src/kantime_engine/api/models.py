@@ -116,6 +116,7 @@ class WorkbookSpec:
     processing_revision: str = ""
     resume_result_factory: Callable[[Mapping[str, Any]], RowResult | None] | None = None
     preserve_source_workbook: bool = False
+    metadata_columns: Mapping[str, str] = field(default_factory=dict)
 
     def column(self, key: str) -> ColumnSpec:
         for column in self.columns:

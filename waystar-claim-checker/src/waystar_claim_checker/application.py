@@ -15,6 +15,7 @@ from .claims import identifier, money, service_date, clean_input_value
 from kantime_engine.spreadsheet_source import normalize_header
 from kantime_engine.ct_reporting import recheck_disabled
 from .pages import CLAIMS_URL, HH_CLAIMS_URL, ClaimsPage, load_profile
+from .identity import OFFICE_HEADERS, PAYOR_HEADERS, resolve_identity, identity_text
 
 # Shared point-of-use aliases; source headers and cells are never renamed.
 INPUT_ALIASES = {
@@ -32,8 +33,8 @@ OUTPUT_KEYS = ("office", "patient_full_name", "pcn", "stmt_start", "stmt_end", "
 CLAIM_COLUMNS = (
     ColumnSpec("serial", "Sr #"),
     ColumnSpec("patient_full_name", "PatientName", format=ColumnFormat.TEXT),
-    ColumnSpec("office", "Office", format=ColumnFormat.TEXT),
-    ColumnSpec("contract", "Contract", format=ColumnFormat.TEXT),
+    ColumnSpec("office", "Office", aliases=OFFICE_HEADERS, format=ColumnFormat.TEXT),
+    ColumnSpec("contract", "Payor", aliases=PAYOR_HEADERS, format=ColumnFormat.TEXT),
     ColumnSpec("visit_date", "VisitDate", format=ColumnFormat.TEXT),
     ColumnSpec("visit_supply_expense", "Visit/Supply/Expense", format=ColumnFormat.CURRENCY),
     ColumnSpec("pcn", "InvoiceNumber", format=ColumnFormat.TEXT),
@@ -130,8 +131,8 @@ def not_found_output(source, result):
     if patient_id is not None and insurance_id is not None and str(patient_id) != str(insurance_id):
         notes.append(f"Patient ID (input): {patient_id}")
     return dict(
-        contract=read("Contract", "Payer", "Insurance") or result.get("contract", ""),
-        office=read("Office", "Agency", "Agency Name", "Office Name") or result.get("office", ""),
+        contract=("" if result.get("identity_conflict") else result.get("contract") or read(*PAYOR_HEADERS)),
+        office=("" if result.get("identity_conflict") else result.get("office") or read(*OFFICE_HEADERS)),
         patient_full_name=patient_name,
         pcn=read(*INPUT_ALIASES["invoice"]),
         dob=read("DOB", "Date of Birth", "Birth Date"),
@@ -160,6 +161,11 @@ def resume_from_excel(source):
         index = find_column_index(headers, column)
         output[column.key] = source[headers[index]] if index is not None else None
     values = {"pcn": output["pcn"], "office": output["office"], "contract": output["contract"], "claim_rows": []}
+    identity_review = str(cells.get("identityreview") or "").strip()
+    if identity_review:
+        values["identity_review"] = identity_review
+        values["checker_comments"] = identity_review
+        return RowResult(RowDisposition.RETRY_LATER, values=values, comment=identity_review)
     if error or status not in {"done", "skipped"}:
         values["checker_comments"] = error
         return RowResult(RowDisposition.RETRY_LATER, values=values, comment=error or None)
@@ -208,12 +214,15 @@ WORKBOOK = WorkbookSpec(
         ColumnSpec("service_from", "Statement Period Start Date", aliases=INPUT_ALIASES["visit"], format=ColumnFormat.DATE),
         ColumnSpec("service_to", "Statement Period End Date", aliases=("EndDate",), format=ColumnFormat.DATE),
         ColumnSpec("invoice_amount", "Invoice Amount", aliases=INPUT_ALIASES["amount"], format=ColumnFormat.CURRENCY),
-        ColumnSpec("source_contract", "Contract", aliases=("Payer", "Insurance"), format=ColumnFormat.TEXT),
+        ColumnSpec("source_contract", "Contract", aliases=("Insurance", "Insurance Name"), format=ColumnFormat.TEXT),
+        ColumnSpec("source_payor", "Payor", aliases=("Payer", "Payor Name", "Payer Name"), format=ColumnFormat.TEXT),
+        ColumnSpec("source_payer", "Payer", aliases=("Payer Name",), format=ColumnFormat.TEXT),
+        ColumnSpec("source_insurance", "Insurance", aliases=("Insurance Name",), format=ColumnFormat.TEXT),
         ColumnSpec("recheck", "Recheck", format=ColumnFormat.TEXT),
         ColumnSpec("icn", "ICN", format=ColumnFormat.TEXT),
         ColumnSpec("comments", "Comments", provision=True, anchor=True, format=ColumnFormat.LONG_TEXT),
         ColumnSpec("patient_full_name", "PATIENT FULL NAME", provision=True, format=ColumnFormat.TEXT),
-        ColumnSpec("office", "Office", aliases=("Agency", "Agency Name", "Office Name"), provision=True, format=ColumnFormat.TEXT),
+        ColumnSpec("office", "Office", aliases=OFFICE_HEADERS, provision=True, format=ColumnFormat.TEXT),
         ColumnSpec("pcn", "PCN", provision=True, format=ColumnFormat.TEXT),
         ColumnSpec("stmt_start", "Stmt Start", provision=True, format=ColumnFormat.DATE),
         ColumnSpec("stmt_end", "Stmt End", provision=True, format=ColumnFormat.DATE),
@@ -243,19 +252,20 @@ WORKBOOK = WorkbookSpec(
                     processed_only_columns=("office", "contract"),
                     cell_borders=True,
                     empty_result_factory=not_found_output,
-                    source_fallback_columns={"contract": ("Contract", "Payer", "Insurance"),
+                    source_fallback_columns={"contract": PAYOR_HEADERS,
                                              "office": ("Office", "Agency", "Agency Name", "Office Name"),
                                              "dob": ("DOB", "Date of Birth", "Birth Date"),
                                              "invoice_date": ("Invoice Date", "InvoiceDate"),
                                              "last_action_taken": ("Last Action Taken", "LAT", "Last Action"),
                                              "recheck": ("Recheck",)},
-                    missing_values={"contract": "NGS"},
+                    missing_values={},
                     freeze_panes="A2", primary=True),),
     hide_source_results=True,
     compact_summary=True,
     save_copy_if_locked=True,
-    processing_revision="multi-emr-ct-v8-standard-alignment",
+    processing_revision="multi-emr-ct-v9-output-identity",
     preserve_source_workbook=True,
+    metadata_columns={"Office": "office", "Payor": "contract", "Identity Review": "identity_review"},
     resume_result_factory=resume_from_excel,
 )
 
@@ -304,6 +314,8 @@ class Automation(PortalAutomationBase):
         self.spec = automation_spec()
         self.profile = None
         self.office = ""
+        self.portal_payor = ""
+        self._identity_captured = False
 
     def validate_application_inputs(self, inputs, variant):
         pass
@@ -328,8 +340,13 @@ class Automation(PortalAutomationBase):
             ) from None
         page = ClaimsPage(context, self.profile)
         context.logger.user("Preparing Waystar Claims search...", event="portal.prepare_started")
-        page.open()
         self.office = ""
+        self.portal_payor = ""
+        self._identity_captured = False
+        page.open()
+        self.office = identity_text(page.read_office())
+        self.portal_payor = identity_text(page.read_payor())
+        self._identity_captured = True
         context.logger.user("Waystar is ready. Starting the invoice batch...", event="portal.prepare_completed")
 
     def restore_ready_state(self, context, cause=None):
@@ -345,12 +362,22 @@ class Automation(PortalAutomationBase):
         if recheck_disabled(record.values.get("recheck")):
             return RowResult(RowDisposition.SKIPPED, values={"claim_rows": []},
                              diagnostic_tags={"branch": "recheck_disabled"})
+        if self._identity_captured:
+            identity_page = ClaimsPage(context, self.profile)
+            self.office = identity_text(identity_page.read_office(timeout_ms=0))
+            self.portal_payor = identity_text(identity_page.read_payor())
         values = {key: "" for key in OUTPUT_KEYS}
         variant = getattr(context, "variant", self.spec.variants[0])
         is_hh = variant.payer == "HH - Medicare"
-        values["office"] = str(record.values.get("office") or self.office).strip()
-        values["contract"] = (str(record.values.get("source_contract") or "").strip()
-                              if variant.id == "automatic" else "HH Medicare" if is_hh else variant.payer)
+        payors = [record.values.get(key) for key in
+                  ("source_payor", "source_payer", "source_contract", "source_insurance")]
+        if variant.id != "automatic" and not any(identity_text(value) for value in payors):
+            payors.append("HH Medicare" if is_hh else variant.payer)
+        values.update(resolve_identity(record.values.get("office"), payors, self.office, self.portal_payor))
+        if values["identity_conflict"]:
+            return RowResult(RowDisposition.RETRY_LATER, comment=values["identity_review"],
+                             values=dict(values, claim_rows=[], checker_comments=values["identity_review"]),
+                             diagnostic_tags={"branch": "identity_conflict"})
         values["checked_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         pcn = identifier(record.values.get("invoice_no"))
         if not pcn:

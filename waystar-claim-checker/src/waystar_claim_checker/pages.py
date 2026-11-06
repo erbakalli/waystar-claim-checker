@@ -158,7 +158,7 @@ def load_profile(path):
         raise ValueError("Live result selectors must be verified against your Waystar account first")
     if not isinstance(profile.get("headers", {}), dict):
         raise ValueError("Portal profile headers must be a mapping")
-    for key in ("submit", "next_page", "busy", "reason_tooltip", "data_rows", "selected_pcn"):
+    for key in ("submit", "next_page", "busy", "reason_tooltip", "data_rows", "selected_pcn", "payor_selector"):
         if key in profile and not isinstance(profile[key], str):
             raise ValueError("Optional portal selectors must be strings")
     if "column_headers" in profile:
@@ -266,7 +266,23 @@ class ClaimsPage:
             self.context.actions.goto(self.context.page, self.start_url, timeout_ms=60_000)
         self.select_pcn()
 
-    def read_office(self):
+    def _identity_text(self, surface):
+        text = surface.evaluate("""() => {
+            const blocked = '.RadGrid, [role="grid"], .RadWindow, [role="dialog"], textarea, script, style';
+            function read(node) {
+                if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+                if (node.nodeType !== Node.ELEMENT_NODE || node.matches(blocked)) return '';
+                if (node !== document.body && (!node.getClientRects().length || getComputedStyle(node).visibility === 'hidden')) return '';
+                if (node.tagName === 'BR') return '\\n';
+                if (node.tagName === 'SELECT') return node.selectedOptions[0]?.textContent || '';
+                const text = [...node.childNodes].map(read).join('');
+                return /^(DIV|P|HEADER|SECTION|LI|TR)$/.test(node.tagName) ? '\\n' + text + '\\n' : text;
+            }
+            return read(document.body);
+        }""")
+        return text if isinstance(text, str) else ""
+
+    def read_office(self, timeout_ms=10_000):
         """Read the active Account heading once, excluding its numeric account ID."""
         office = ""
         def captured():
@@ -285,7 +301,7 @@ class ClaimsPage:
                 try:
                     # A detached/loading frame must not consume the full default
                     # Playwright timeout or prevent reading the outer header.
-                    text = surface.locator("body").inner_text(timeout=500)
+                    text = self._identity_text(surface)
                 except CancellationRequested:
                     raise
                 except Exception:
@@ -295,9 +311,12 @@ class ClaimsPage:
                     office = " ".join(match.group(1).split())
                     return bool(office)
             return False
+        self.context.cancellation.raise_if_cancelled()
+        if timeout_ms == 0:
+            return office if captured() else ""
         try:
             outcome = self.context.actions.wait_for_any(
-                {"login": self.login_visible, "account": captured}, timeout_ms=10_000)
+                {"login": self.login_visible, "account": captured}, timeout_ms=timeout_ms)
             if outcome == "login" or self.signed_out():
                 raise self.reauth_error()
             if not office:
@@ -307,6 +326,39 @@ class ClaimsPage:
             raise
         except Exception:
             return ""
+
+    def read_payor(self):
+        """Read explicit payer labels, never infer a payer from a portal hostname."""
+        from .identity import canonical_payor, identity_key
+        values = {}
+        for surface in [self.page, self.context.page, *self.context.page.frames]:
+            self.context.cancellation.raise_if_cancelled()
+            if urlparse(_surface_url(surface)).hostname not in ("mgmt.zirmed.com", self.portal_host):
+                continue
+            try:
+                selector = self.profile.get("payor_selector")
+                if selector:
+                    label = surface.locator(selector)
+                    if label.count() == 1 and label.is_visible():
+                        text = label.inner_text(timeout=500).strip()
+                        if text:
+                            value = canonical_payor(text)
+                            values.setdefault(identity_key(value), value)
+                # Exclude result tables/popups: a claim's notes are not account identity.
+                text = self._identity_text(surface)
+                if not isinstance(text, str):
+                    continue
+                for match in re.finditer(r"(?:^|\n)\s*(?:Payor|Payer|Contract|Medicare Contractor)\s*:\s*([^\r\n]{1,120})", text, re.I):
+                    value = canonical_payor(re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", match.group(1)))
+                    if value:
+                        values.setdefault(identity_key(value), value)
+            except CancellationRequested:
+                raise
+            except Exception:
+                continue
+        if len(values) > 1:
+            return "Ambiguous payer labels: " + "; ".join(values.values())
+        return next(iter(values.values()), "")
 
     def select_pcn(self):
         try:
