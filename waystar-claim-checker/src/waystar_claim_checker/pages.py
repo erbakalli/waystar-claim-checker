@@ -7,6 +7,7 @@ from urllib.parse import urlparse, parse_qs
 from kantime_engine import PortalAutomationError, RecoveryAction, RetryScope, BrowserSpec
 from kantime_engine.cancellation import CancellationRequested
 from .claims import header_indexes, parse_table
+from .identity import canonical_payor
 
 CLAIMS_URL = (
     "https://mgmt.zirmed.com/ExternalUserManagement/IntegrationRedirect/Index"
@@ -906,13 +907,19 @@ class ClaimsPage:
         self.context.cancellation.raise_if_cancelled()
         if not str(code).strip():
             return ""
-        # Detect the current cell's capabilities, independent of payer and host.
-        # Recheck every row because a grid can contain both popup and tooltip cells.
+        payor = canonical_payor(getattr(self, "payor", ""))
         link = cell.locator('a[href*="reason.aspx" i]:visible, [onclick*="reason.aspx" i]:visible')
         link_count = link.count()
-        if link_count > 1:
+        if payor in ("HH Medicare", "Palmetto GBA") and not link_count:
+            # Some portals attach the popup handler to a generic anchor or the
+            # code cell, without exposing reason.aspx in the HTML attributes.
+            link = cell.locator('a:visible, button:visible, [role="button"]:visible, [onclick]:visible')
+            link_count = link.count()
+            if not link_count:
+                link, link_count = cell, 1
+        if payor != "NGS" and link_count > 1:
             raise ValueError("Primary Reason has multiple description popup targets")
-        if link_count == 1:
+        if payor != "NGS" and link_count == 1:
             self.progress("Primary Reason uses a clickable description popup.", "claims.reason_method_click")
             # A broken popup must fail the invoice; never silently accept its title.
             return self.read_reason_window(link, link.inner_text().strip())
@@ -951,9 +958,7 @@ class ClaimsPage:
     def read_reason_window(self, link, code):
         target = (link.get_attribute("href") or "") + " " + (link.get_attribute("onclick") or "")
         match = re.search(r"reason\.aspx\?reasonid=(\d+)", target, re.I)
-        if not match:
-            raise ValueError("Reason link has no recognized description target")
-        reason_id = match.group(1)
+        reason_id = match.group(1) if match else None
         description = ""
 
         def surfaces():
@@ -966,7 +971,7 @@ class ClaimsPage:
             for surface in surfaces():
                 address = urlparse(_surface_url(surface))
                 is_reason_frame = (address.path.lower().endswith("/reason.aspx")
-                                   and parse_qs(address.query).get("reasonid") == [reason_id])
+                                   and (reason_id is None or parse_qs(address.query).get("reasonid") == [reason_id]))
                 try:
                     text = surface.evaluate("""({code, frame}) => {
                         const roots = frame ? [document.body] :
@@ -1004,7 +1009,7 @@ class ClaimsPage:
                                 try {
                                     const url = new URL(frame.src, document.baseURI);
                                     return url.pathname.toLowerCase().endsWith('/reason.aspx') &&
-                                        url.searchParams.get('reasonid') === id;
+                                        (id === null || url.searchParams.get('reasonid') === id);
                                 } catch (_) { return false; }
                             });
                             if (!matchingFrame && (!label || label[1].toUpperCase() !== code.trim().toUpperCase())) continue;
@@ -1035,7 +1040,7 @@ class ClaimsPage:
                                 try {
                                     const url = new URL(frame.src, document.baseURI);
                                     return url.pathname.toLowerCase().endsWith('/reason.aspx') &&
-                                        url.searchParams.get('reasonid') === id;
+                                        (id === null || url.searchParams.get('reasonid') === id);
                                 } catch (_) { return false; }
                             });
                         });

@@ -59,6 +59,52 @@ for (const id of ['hover1','hover2']) {
 
 
 class ReasonDetectionTests(unittest.TestCase):
+    def test_resolved_payor_controls_click_or_hover_without_a_payer_selector(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="msedge", headless=True)
+            try:
+                page = browser.new_page()
+                def route(request):
+                    if urlparse(request.request.url).path.endswith('/reason.aspx'):
+                        body = '<div>Reason Code: U5235</div><textarea>Verified popup description</textarea>'
+                    else:
+                        body = HTML
+                    request.fulfill(body=body, content_type='text/html')
+                page.route('**/*', route)
+                variant = create_application().spec.automation.variants[-1]
+                for payor in ('HH Medicare', 'Palmetto GBA', 'NGS'):
+                    for target in ('anchor', 'cell'):
+                        with self.subTest(payor=payor, target=target):
+                            page.goto('https://analytics.ecorpnet.com/member/payer-policy-test')
+                            page.evaluate('''target => {
+                                const cell=document.querySelector('#popup1');
+                                cell.title='Verified NGS hover description';
+                                if (target === 'anchor') {
+                                    const a=cell.querySelector('a');
+                                    a.href='#';
+                                    a.onclick=e=>{e.preventDefault();openReason('reason.aspx?reasonid=1')};
+                                } else {
+                                    cell.textContent='U5235';
+                                    cell.addEventListener('click',()=>openReason('reason.aspx?reasonid=1'));
+                                }
+                            }''', target)
+                            token = CancellationToken()
+                            adapter = ClaimsPage(SimpleNamespace(page=page, cancellation=token,
+                                actions=BrowserActions(token, default_timeout_ms=1000), variant=variant), {})
+                            adapter.payor = payor
+                            expected = ('Verified NGS hover description' if payor == 'NGS'
+                                        else 'Verified popup description')
+                            self.assertEqual(adapter.read_primary_reason(page.locator('#popup1'), 'U5235'), expected)
+                            self.assertEqual(page.evaluate('events'), [] if payor == 'NGS' else ['open:1', 'close'])
+                            self.assertFalse(page.locator('.RadWindow').is_visible())
+                # A click payer must not silently export an available tooltip
+                # when its required popup does not open.
+                adapter.payor = 'HH Medicare'
+                with self.assertRaises(ValueError):
+                    adapter.read_primary_reason(page.locator('#native'), 'U3000')
+            finally:
+                browser.close()
+
     def test_both_payers_handle_mixed_click_hover_and_titles_in_either_order(self):
         self.run_detection()
 

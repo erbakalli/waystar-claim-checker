@@ -263,7 +263,7 @@ WORKBOOK = WorkbookSpec(
     hide_source_results=True,
     compact_summary=True,
     save_copy_if_locked=True,
-    processing_revision="multi-emr-ct-v9-output-identity",
+    processing_revision="multi-emr-ct-v10-payer-reasons",
     preserve_source_workbook=True,
     metadata_columns={"Office": "office", "Payor": "contract", "Identity Review": "identity_review"},
     resume_result_factory=resume_from_excel,
@@ -386,7 +386,9 @@ class Automation(PortalAutomationBase):
             return RowResult(RowDisposition.SKIPPED, comment=None, values=values,
                              diagnostic_tags={"branch": "missing_pcn"})
         try:
-            claims = ClaimsPage(context, self.profile).search(pcn)
+            page = ClaimsPage(context, self.profile)
+            page.payor = values["contract"]
+            claims = page.search(pcn)
             if any(identifier(c.invoice) != pcn for c in claims):
                 raise PortalAutomationError("Search returned a different or missing PCN. Verify the result profile.",
                                             reason="pcn_mismatch", recovery=RecoveryAction.STOP)
